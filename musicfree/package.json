@@ -1,0 +1,20 @@
+{
+  "name": "pet-musicfree-host",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MusicFree 插件宿主：桌宠用它加载 MusicFree 插件（音源/歌词），不需要安装 MusicFree 本体",
+  "main": "host.js",
+  "scripts": {
+    "selftest": "node host.js list"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "big-integer": "^1.6.52",
+    "cheerio": "^1.0.0",
+    "crypto-js": "^4.2.0",
+    "dayjs": "^1.11.13",
+    "he": "^1.2.0",
+    "qs": "^6.13.0",
+    "webdav": "^5.11.0"
+  }
+}

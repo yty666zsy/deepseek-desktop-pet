@@ -1,0 +1,22 @@
+# DeepSeek 桌宠助手 依赖清单
+# 核心依赖（必需）：
+#   PySide6   —— GUI 框架（Qt6 绑定）
+# 可选依赖（Live2D 模式）：
+#   live2d-py —— Live2D 模型渲染（import 名 live2d）
+#   pyopengl  —— OpenGL 绑定（live2d-py 的依赖）
+
+PySide6>=6.5
+
+# 可选依赖（MCP 扩展）：
+#   mcp     —— Model Context Protocol 客户端（外部工具接入）
+
+mcp>=2.0
+
+# 可选依赖（图片 / 文档解析）：代码里是懒加载，没装时只降级对应功能并提示，不影响启动
+#   Pillow —— 拖入/粘贴图片转 PNG 后走 Windows OCR
+#   pypdf  —— 读取 PDF 文本（前 15 页）
+Pillow>=10.0
+pypdf>=4.0
+
+# 可选依赖（开发工具）：
+#   rembg —— 立绘自动抠图（cut_actions.py 用）

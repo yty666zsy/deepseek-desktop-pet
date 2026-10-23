@@ -1,0 +1,9570 @@
+# -*- coding: utf-8 -*-
+"""
+DeepSeek 桌宠助手 v5
+====================
+动画系统 v2（自然版）：
+- 呼吸：整图缩放 1%（轻微起伏）
+- 呆毛摆动：头顶头发层独立 ±8° 旋转
+- 眨眼：blink 立绘局部替换眼睛区域（整图切换，150ms）
+- 尾巴动感：整图 ±1.5° 低频摇摆（幅度小，不显全身晃动）
+- 保留：双角色、位置记忆、打字机、托盘、连击等全部功能
+
+运行：python desktop_pet.py
+"""
+import sys
+import os
+import json
+import random
+import math
+import time
+import ctypes
+import threading  # v6.18 ApiStats 需要
+import datetime  # v6.18 ApiStats 需要（record/调试日志）
+import winsound
+
+# P1 模块化：系统工具层 / 存储层（拆自本文件，纯函数无 UI 依赖）
+from pet_sysutils import (
+    # v6.91：check_dangerous（只读白名单）不再直接调用 —— 问不问由 pet_permission 按
+    # 聊天框里的权限档位决定（严格档它照样用这套判定，🛡 档改用更窄的「真破坏性」表）
+    read_clipboard_text as _read_clipboard_text,
+    write_clipboard_text as _write_clipboard_text,
+    run_ps as _run_ps,
+    volume_ps as _volume_ps,
+    quote_ps_single as _ps_quote,
+    open_shell_target as _open_shell_target,
+    open_url as _open_url,
+    open_search_url as _open_search_url,
+    is_safe_process_name as _is_safe_process_name,
+)
+from pet_storage import atomic_write_json as _atomic_write_json_impl, atomic_write_text as _atomic_write_text
+from pet_log import get_logger
+from pet_docs import (read_docx_text, read_pdf_text, read_xlsx_text, read_pptx_text,
+                        ocr_image, read_own_file, TEXT_BY_KIND)
+from pet_selfcode import search_code, write_file_tool, edit_own_code
+
+log = get_logger('ui')
+from api_stats import ApiStats
+from deepseek_client import chat_completions, stream_chat_completions, beta_endpoint
+from memory_store import load_memory, save_memory, remember_fact
+from memory_engine import search_memory, search_memory_for_injection, extract_memories
+from chat_render import split_rich_blocks, split_md_blocks, md_to_html, md_table, looks_like_table
+from chat_cards import CodeCard as _CodeCard, TableCard as _TableCard
+from prompt_builder import guess_status, build_memory_block, build_todo_block, build_system_prompt
+from code_checker import check_python_blocks
+import pet_bubble as pb  # 气泡/Markdown 渲染装配层（批 3）
+import pet_reactions as reactions  # v6.78 单击立绘的反应表（30+ 种）
+from pet_cloud import CloudBubble  # v6.77 对话折叠时的云朵提示框
+import pet_anim as anim  # 状态机与动画（低耦合段，批 4）
+from pet_anim import SCENE_ACTIONS  # 场景动作表（批 4）
+from care_engine import user_idle_minutes, judge_wakeup, followup_message
+import care_engine  # v6.60 批4：兜底关心措辞库（fallback_lines / pick_fallback）
+import pet_foreground as fgwin  # 前台程序感知（v6.59，可选·默认关闭；隐私边界见模块头部）
+from model_registry import (ModelRegistry, clamp_tokens, clamp_effort, DEFAULT_ENDPOINT,
+                            DEFAULT_EFFORT, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS)
+from model_manager_ui import ModelManagerDialog  # Phase 2 模型管理对话框
+from vision_helper import build_vision_content  # v6.62 图片直送模型（视觉）
+from side_panel import SidePanel            # v6.65 右侧信息栏（多页签，可增删）
+from asr import AsrEngine                   # v6.66 离线语音输入（WinRT）
+from files_api import FilesCache, build_content_via_files  # v6.62 图片走 Files API 复用
+from voice_io import VoiceIO, VOICE_CHOICES as _VOICE_CHOICES, DEFAULT_VOICE  # v6.63/6.64 语音
+from settings_ui import SettingsDialog  # Phase 5 统一设置窗口
+import pet_window as pwin  # v6.90 所有窗口标题栏的「—」隐藏键（见模块头部 Win32 说明）
+import pet_permission as perm  # v6.91 聊天框左边的权限档位（放不放权）
+from tools_registry import AI_TOOLS, TOOL_STATUS, tools_for_mode, strict_tools
+from tools_executor import get_time_str, calculate_expr, lock_screen_now, query_weather, parse_choices
+from PySide6.QtCore import (Qt, QTimer, QPoint, QRect, QRectF, Signal, Slot as QtSlot,
+                            QObject, QEvent)
+from PySide6.QtGui import (QPixmap, QPainter, QColor, QAction, QPainterPath, QFont, QIcon, QImage, QTransform, QCursor,
+                           QFontMetrics)
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QLabel, QMenu, QGraphicsOpacityEffect,
+    QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QSizePolicy,
+    QSystemTrayIcon, QTextBrowser, QTextEdit, QLineEdit, QInputDialog, QScrollArea,
+    QListWidget, QListWidgetItem, QAbstractItemView
+)
+from mcp_bridge import McpBridge  # v6.20 MCP 桥接（外部 MCP server 工具接入）
+from plugin_manager import PluginManager  # v6.21 插件系统（tool/menu/rules/theme/skill）
+from affection_engine import AffectionEngine  # v6.30 好感度引擎
+from memory_events import MemoryEvents  # v6.30 回忆日志
+from affection_ui import RelationDialog, CostBubble, MemoriesDialog  # v6.30 关系面板/费用气泡/回忆相册
+from pet_minigames import GameWindow  # v6.30 小游戏（v6.58 主题接入见 _publish_theme）
+from pet_theme import DEFAULT_THEME, TOKEN_GROUPS  # v6.57 主题 token 唯一源（A1：原内联在本文件）
+import pet_theme                                  # v6.58 A2-2：生效主题通道（set_active/subscribe）
+import platform_layer as pl  # v6.72 批次2：平台能力统一门面（自启/窗口特效已收编）
+
+# Windows DWM 常量（保留 DWMWA_NCRENDERING_POLICY 备用于未来阴影处理）
+DWMWA_NCRENDERING_POLICY = 2
+DWMNCRP_DISABLED = 1
+WS_EX_TOOLWINDOW = 0x80
+
+if getattr(sys, 'frozen', False):
+    # PyInstaller 打包：资源在 exe 同目录（用户放 assets/config.json 在旁边）
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OCR_PS1 = os.path.join(BASE_DIR, 'ocr_helper.ps1')
+LIVE2D_MODEL = os.path.join(BASE_DIR, 'assets', 'live2d', 'mao', 'Mao.model3.json')
+ASSETS = os.path.join(BASE_DIR, 'assets')
+CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
+MODELS_PATH = os.path.join(BASE_DIR, 'models.json')   # 模型档案（模型身份的唯一来源）
+MEMORY_PATH = os.path.join(BASE_DIR, 'memory.json')
+TODO_PATH = os.path.join(BASE_DIR, 'todos.json')
+AFFECTION_PATH = os.path.join(BASE_DIR, 'affection.json')   # v6.30 好感度
+MEMORIES_PATH = os.path.join(BASE_DIR, 'memories.json')     # v6.30 回忆日志
+
+# ---------- v6.54：静默异常统一出口 ----------
+# 背景：全面体检发现 122 处 `except ...: pass/continue`——出问题时“它怎么不记得了 / 怎么不动了”
+# 完全无痕。这里提供统一出口：**只记日志**（logs/pet.log，INFO 级），不改变任何行为。
+# 重点覆盖“用户可感知失败”的路径：AI 任务链 / 数据落盘 / 记忆提取 / 工具执行 / 用量统计 / 系统集成。
+def _silent_log(where, exc):
+    try:
+        get_logger('silent').info('%s | %s: %s', where, type(exc).__name__, exc)
+    except Exception:
+        pass          # 日志系统自己不能把主程序拖垮
+
+
+def asset(role, state):
+    p = os.path.join(ASSETS, role, f'{role}_{state}.png')
+    if os.path.exists(p):
+        return p
+    # v6.30 兜底：新状态素材缺失时降级到已有状态
+    fallback = {'hungry': 'eating', 'victory': 'happy', 'defeat': 'sad',
+                'kiss': 'hug_whale', 'shy_hug': 'hug_whale'}
+    fb = fallback.get(state)
+    if fb:
+        p2 = os.path.join(ASSETS, role, f'{role}_{fb}.png')
+        if os.path.exists(p2):
+            return p2
+    return os.path.join(ASSETS, role, f'{role}_idle.png')
+
+# ============ 国际化（v6.20，右键菜单/提示/AI 回复语言） ============
+UI_ZH = {
+    'menu_role': '🎭 角色', 'menu_chat': '🤖 和 AI 聊天', 'menu_interact': '💬 互动',
+    'say': '💬 说句话', 'think': '🤔 思考一下', 'random': '🎲 随机动作', 'sleep': '💤 睡觉/唤醒',
+    'toggle_chat': '💬 隐藏/显示聊天窗口', 'active_care': '💗 主动关心',
+    'edge_mode': '📌 贴边模式：', 'edge_hidden': '完全消失', 'edge_peek': '扒边',
+    'menu_actions': '🎬 动作', 'menu_personality': '🎭 性格切换', 'menu_settings': '⚙️ 设置',
+    'api_setting': '🔑 API 设置…', 'search_setting': '🌐 联网搜索', 'dlg_search': '联网搜索设置', 'attach_tip': '附加文件', 'model_menu': '🎯 角色模型', 'current': '当前', 'thinking': '思考模式', 'temperature': '采样温度', 'model_mgr': '🎯 模型管理…',
+    'style_menu': '💬 回复风格', 'token_menu': '📝 回复长度', 'custom': '🎯 自定义…',
+    'city': '🌆 默认城市…', 'custom_personality': '🎭 自定义性格…',
+    'memory_menu': '🧠 记忆管理', 'view_memory': '📋 查看记忆', 'delete_memory': '🗑 删除一条…', 'clear_memory': '🧹 清空全部…',
+    'export_chat': '📤 导出聊天记录', 'mem_time': '时间', 'mem_who': '谁', 'mem_select_all': '全选', 'mem_select_none': '全不选', 'mem_select_me': '只选我', 'mem_select_pet': '只选桌宠', 'mem_export': '导出', 'autostart': '🚀 开机自启', 'on': '（已开）', 'off': '（已关）',
+    'hide_tray': '🏠 最小化到托盘', 'exit': '✕ 退出',
+    'language_menu': '🌐 语言', 'language_zh': '中文', 'language_en': 'English',
+    'chat_placeholder': '和桌宠聊天…（Enter 发送，Shift+Enter 换行，/new 新对话，/clear 清空）',
+    'new_chat': '✚ 新对话',
+    'new_chat_tip': '开一段全新的对话（当前对话自动存档到 chat_archive/，可随时找回）',
+    'chat_empty_hint': '🌱 新对话已开始，说点什么吧～\n（旧对话都在 chat_archive/ 里）',
+    'pet_style_tip': '调整人物大小与透明度（滑块即时生效）',
+    'pet_style_menu': '🎨 大小 / 透明度…',
+    'music_tip': '打开音乐面板（搜歌播放，歌词显示在头顶）',
+    'dl_tip': '打开下载面板（粘贴视频链接就能下：B站/YouTube/抖音/小红书…）',
+    'cv_tip': '打开文件转换面板（拖文件进来，图片/音视频/PDF/Office/表格/压缩包随你转）',
+    'pw_tip': '见面照片墙（把照片拖进来，按拍摄日期自动分成一次次见面）',
+    'pw_btn': '📷 照片',
+    'pw_card_tip': '桌宠旁边的见面小卡片（最近的照片 + 下次见面倒计时）',
+    'lg_tip': '记账：说一句「午饭 32」就记一笔，点这里看月度报表与预算',
+    'lg_menu': '¥ 记账…',
+    # ---- v6.91 权限档位（聊天输入框左边那个锁）----
+    # 注意：这里的档位名**不带图标**（图标由 perm.ICON 统一加，菜单/提示共用一套，
+    # 免得像第一版那样菜单里出现「🔒 🔒 严格」两个锁）
+    'perm_menu': '🔐 权限：AI 干活前问不问',
+    'perm_strict': '严格：每次都问',
+    'perm_strict_hint': '严格模式：只读命令以外都先问一句（连写文件、开程序都会停下来问你）',
+    'perm_smart': '只问真危险',
+    'perm_smart_hint': '放行写文件、开程序；删/格式化/关机/改注册表/杀进程/下载执行仍然问',
+    'perm_open': '全放权（本轮对话）',
+    'perm_open_hint': '本轮对话里 AI 执行任何操作都不再问你（会记审计，事后可查）',
+    'perm_scope': '只对本轮对话有效：点「✚ 新对话」或重启桌宠就自动回到 🔒 严格',
+    'person_gentle': '温柔', 'person_tsundere': '傲娇', 'person_sarcastic': '吐槽', 'person_energetic': '元气', 'person_cold': '高冷',
+    'style_short': '极简', 'style_normal': '标准', 'style_detailed': '详细',
+    'tok_short': '短（500）', 'tok_normal': '标准（1000）', 'tok_long': '长（2000）', 'tok_xlong': '超长（4000）', 'tok_max': '极长（16000）', 'tok_big': '超长2（32000）', 'tok_huge': '超长3（64000）', 'tok_xhuge': '极限（128000）',
+    'lang_hint': '请用中文回复。', 'lang_switched': '语言已切换为中文',
+    'dlg_api': '🔑 API 设置', 'dlg_model': '模型设置', 'dlg_city': '默认城市',
+    'dlg_personality': '自定义性格', 'dlg_tokens': '回复长度',
+    'dlg_delete_mem': '删除记忆', 'dlg_clear_mem': '清空记忆', 'dlg_confirm': '⚠️ 危险操作确认',
+    'allow': '允许执行', 'deny': '拒绝', 'show_pet': '🏠 显示桌宠',
+    'archive': '📦 存档并清空对话', 'mem_mgr': '🖥️ 管理窗口…', 'mem_add': '➕ 添加记忆', 'mem_delete': '🗑 删除选中', 'mem_all': '全部',
+    'mem_search': '🔍 搜索记忆…', 'mem_imp': '重要度', 'mem_content': '内容', 'mem_role': '角色', 'mem_time': '时间', 'mem_edit': '编辑',
+    'reminder_menu': '⏰ 提醒管理', 'rem_left': '剩余', 'rem_type': '类型', 'rem_cancel': '🗑 取消选中',
+    'rem_clear': '🧹 清空全部', 'rem_none': '暂无提醒', 'rem_followup': '回访', 'rem_normal': '提醒',
+    'mem_backup': '💾 备份记忆', 'mem_import': '📥 导入记忆',
+    'l2d_preview': '🔧 Live2D 调试窗口', 'mode_menu': '🎭 显示模式', 'mode_static': '🖼️ 静态立绘', 'mode_live2d': '🎬 Live2D 模式',
+    'l2d_model_menu': '🤖 Live2D 模型', 'l2d_no_model': '未找到模型',
+    'todo_menu': '📋 待办管理', 'todo_status': '状态', 'todo_time': '时间', 'todo_add': '➕ 添加',
+    'todo_done': '✅ 完成选中', 'todo_del': '🗑 删除选中', 'todo_clear_done': '🧹 清空已完成',
+    'todo_placeholder': '输入待办事项，回车添加…', 'todo_empty': '暂无待办',
+}
+UI_EN = {
+    'menu_role': '🎭 Characters', 'menu_chat': '🤖 Chat with AI', 'menu_interact': '💬 Interact',
+    'say': '💬 Say something', 'think': '🤔 Think', 'random': '🎲 Random action', 'sleep': '💤 Sleep/Wake',
+    'toggle_chat': '💬 Show/Hide chat', 'active_care': '💗 Proactive care',
+    'edge_mode': '📌 Edge mode: ', 'edge_hidden': 'Hidden', 'edge_peek': 'Peek',
+    'menu_actions': '🎬 Actions', 'menu_personality': '🎭 Personality', 'menu_settings': '⚙️ Settings',
+    'api_setting': '🔑 API Settings…', 'search_setting': '🌐 Web Search', 'dlg_search': 'Web Search Settings', 'attach_tip': 'Attach files', 'model_menu': '🎯 Models', 'current': 'Current', 'thinking': 'Thinking', 'temperature': 'Temperature', 'model_mgr': '🎯 Model Manager…',
+    'style_menu': '💬 Reply style', 'token_menu': '📝 Reply length', 'custom': '🎯 Custom…',
+    'city': '🌆 Default city…', 'custom_personality': '🎭 Custom personality…',
+    'memory_menu': '🧠 Memory', 'view_memory': '📋 View memory', 'delete_memory': '🗑 Delete one…', 'clear_memory': '🧹 Clear all…',
+    'export_chat': '📤 Export chat', 'mem_time': 'Time', 'mem_who': 'Who', 'mem_select_all': 'All', 'mem_select_none': 'None', 'mem_select_me': 'Me only', 'mem_select_pet': 'Pet only', 'mem_export': 'Export', 'autostart': '🚀 Auto-start', 'on': ' (ON)', 'off': ' (OFF)',
+    'hide_tray': '🏠 Minimize to tray', 'exit': '✕ Exit',
+    'language_menu': '🌐 Language', 'language_zh': '中文', 'language_en': 'English',
+    'chat_placeholder': 'Chat with pet… (Enter send, Shift+Enter newline, /new new chat, /clear reset)',
+    'new_chat': '✚ New chat',
+    'new_chat_tip': 'Start a brand new conversation (the old one is archived to chat_archive/)',
+    'chat_empty_hint': '🌱 New chat started — say something!\n(the old ones are in chat_archive/)',
+    'pet_style_tip': 'Adjust pet size and opacity (sliders apply live)',
+    'pet_style_menu': '🎨 Size / opacity…',
+    'music_tip': 'Open the music panel (search & play, lyrics float above the pet)',
+    'dl_tip': 'Open the download panel (paste a video link: Bilibili/YouTube/TikTok/… and go)',
+    'cv_tip': 'Open the file converter (drop files in: images/audio/video/PDF/Office/sheets/archives)',
+    'pw_tip': 'Meeting photo wall (drop photos in, they group by shooting date into each meeting)',
+    'pw_btn': '📷 Photos',
+    'pw_card_tip': 'Meeting card next to the pet (latest photos + countdown to next meeting)',
+    'lg_tip': 'Ledger: say "lunch 32" to log one; click here for monthly reports and budgets',
+    'lg_menu': '¥ Ledger…',
+    # ---- v6.91 permission tiers (the lock left of the chat input) ----
+    'perm_menu': '🔐 Permissions: ask before the AI acts?',
+    'perm_strict': 'Strict: always ask',
+    'perm_strict_hint': 'Anything beyond read-only commands asks first (even writing a file or starting an app)',
+    'perm_smart': 'Ask only for destructive',
+    'perm_smart_hint': 'Allows writing files and launching apps; delete / format / shutdown / registry / kill / download-and-run still ask',
+    'perm_open': 'Full trust (this chat)',
+    'perm_open_hint': 'The AI runs everything in this chat without asking (audited — you can check later)',
+    'perm_scope': 'Only for this chat: ✚ New chat or restarting the pet returns to 🔒 Strict',
+    'person_gentle': 'Gentle', 'person_tsundere': 'Tsundere', 'person_sarcastic': 'Sarcastic', 'person_energetic': 'Energetic', 'person_cold': 'Cold',
+    'style_short': 'Minimal', 'style_normal': 'Normal', 'style_detailed': 'Detailed',
+    'tok_short': 'Short (500)', 'tok_normal': 'Normal (1000)', 'tok_long': 'Long (2000)', 'tok_xlong': 'Extra (4000)', 'tok_max': 'Very long (16000)', 'tok_big': 'XXLong (32000)', 'tok_huge': 'XXXLong (64000)', 'tok_xhuge': 'Max (128000)',
+    'lang_hint': 'Please reply in English.', 'lang_switched': 'Language switched to English',
+    'dlg_api': '🔑 API Settings', 'dlg_model': 'Model Settings', 'dlg_city': 'Default City',
+    'dlg_personality': 'Custom Personality', 'dlg_tokens': 'Reply Length',
+    'dlg_delete_mem': 'Delete Memory', 'dlg_clear_mem': 'Clear Memory', 'dlg_confirm': '⚠️ Confirm Dangerous Operation',
+    'allow': 'Allow', 'deny': 'Deny', 'show_pet': '🏠 Show pet',
+    'archive': '📦 Archive & Clear Chat', 'mem_mgr': '🖥️ Manager Window…', 'mem_add': '➕ Add Memory', 'mem_delete': '🗑 Delete Selected', 'mem_all': 'All',
+    'mem_search': '🔍 Search memory…', 'mem_imp': 'Importance', 'mem_content': 'Content', 'mem_role': 'Role', 'mem_time': 'Time', 'mem_edit': 'Edit',
+    'reminder_menu': '⏰ Reminders', 'rem_left': 'Left', 'rem_type': 'Type', 'rem_cancel': '🗑 Cancel Selected',
+    'rem_clear': '🧹 Clear All', 'rem_none': 'No reminders', 'rem_followup': 'Follow-up', 'rem_normal': 'Reminder',
+    'mem_backup': '💾 Backup Memory', 'mem_import': '📥 Import Memory',
+    'l2d_preview': '🔧 Live2D Debug Window', 'mode_menu': '🎭 Display Mode', 'mode_static': '🖼️ Static Art', 'mode_live2d': '🎬 Live2D Mode',
+    'l2d_model_menu': '🤖 Live2D Model', 'l2d_no_model': 'No models found',
+    'todo_menu': '📋 Todo Manager', 'todo_status': 'Status', 'todo_time': 'Time', 'todo_add': '➕ Add',
+    'todo_done': '✅ Done', 'todo_del': '🗑 Delete', 'todo_clear_done': '🧹 Clear Done',
+    'todo_placeholder': 'Enter todo, press Enter to add…', 'todo_empty': 'No todos',
+}
+
+# ============ 模型档案（模型身份配置化）============
+# models.json 是模型身份的唯一来源：显示名 / 模型 ID / 接口地址 / 参数 / 价格 / 外观 / 人设。
+# 原先写死在这里的 CHARACTERS 字典已整体迁入档案（见 model_registry.BUILTIN_PROFILES），
+# 本处改为运行时从档案构建，结构与旧字典完全兼容（下游用法无需改动）。
+MODEL_REGISTRY = ModelRegistry(MODELS_PATH, CONFIG_PATH)
+
+
+def build_characters(registry=None):
+    """由模型档案构建角色表（color 由档案里的 hex 转 QColor）"""
+    reg = registry or MODEL_REGISTRY
+    out = {}
+    for ckey, conf in reg.characters().items():
+        conf = dict(conf)
+        try:
+            conf['color'] = QColor(conf.get('color') or DEFAULT_THEME['char_default_color'])
+        except Exception:
+            conf['color'] = QColor(176, 196, 222)
+        out[ckey] = conf
+    return out
+
+
+CHARACTERS = build_characters()
+
+GREET_INTERVAL = (20 * 60 * 1000, 40 * 60 * 1000)
+
+# 场景动作立绘
+# SCENE_ACTIONS 已搬至 pet_anim（批 4），由下方 import 引入
+
+# ============ AI 工具定义（function calling） ============
+
+
+# ============ PowerShell 安全执行（v6） ============
+import re as _re
+import subprocess as _subprocess
+
+# blink 图相对 idle 的平移偏移（相位相关测得）：用于对齐整图切换眨眼
+# 切换时其他部位完全重合，只有眼睛变化，不闪
+BLINK_OFFSETS = {
+    'flash': (0, 0),
+    'pro': (0, 0),
+}
+
+
+# ---------- API 统计（v6.18 自监控：解析 usage，无代理无断链） ----------
+# 主题 token（v6.23 主题系统）已于 v6.57 迁到 pet_theme.py（唯一源，theme 插件同名键可覆盖）
+# 顶部 import 已再导出 DEFAULT_THEME，既有引用（self.theme = dict(DEFAULT_THEME)）无需改动
+
+
+class _DropChatEdit(QTextEdit):
+    """支持文件拖放的聊天输入框（QTextEdit 默认不接受 uri-list 拖放，需子类化）"""
+    def __init__(self, on_files, parent=None):
+        super().__init__(parent)
+        self._on_files = on_files
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)  # 关键：拖放事件实际到达 viewport
+
+    def viewportEvent(self, e):
+        """viewport 级拖放：接受文件拖入，drop 后把路径插入输入框"""
+        from PySide6.QtCore import QEvent as _QE
+        t = e.type()
+        if t in (_QE.Type.DragEnter, _QE.Type.DragMove):
+            if e.mimeData().hasUrls():
+                e.acceptProposedAction()
+                return True
+        elif t == _QE.Type.Drop:
+            if e.mimeData().hasUrls():
+                self._on_files(e.mimeData().urls())
+                e.accept()
+                return True
+        return super().viewportEvent(e)
+
+
+class PetWidget(QWidget):
+    # 类级信号：AI 回复（跨线程安全）
+    ai_reply_signal = Signal(str)
+    ai_status_signal = Signal(str)  # AI 处理状态（思考中/正在执行xx）
+    stream_signal = Signal(str)     # v6.40 流式正文 chunk
+    reasoning_signal = Signal(str)  # v6.40 流式思考 chunk
+    stream_done_signal = Signal()   # v6.40 流式结束
+    wakeup_signal = Signal(str)    # 主动消息（心跳/回访触发）
+    confirm_signal = Signal(object)  # 危险操作确认请求（跨线程回调）
+    weather_signal = Signal(str)   # 早安日报天气结果（跨线程安全）
+    ocr_signal = Signal(str)       # OCR 识别结果（截图粘贴，跨线程安全）
+    cost_bubble_signal = Signal(float)  # v6.30 API 费用气泡（跨线程）
+    balance_signal = Signal(dict)       # v6.61 余额查询结果（跨线程）
+    ui_call_signal = Signal(object)     # v6.58 通用"回主线程执行"通道（工作线程里 QTimer.singleShot 不触发）
+
+    def __init__(self):
+        super().__init__()
+        self._init_state_and_config()
+        self._init_signals_and_hotkeys()
+        self._init_services_and_data()
+        # v6.91：权限档位（AI 执行操作前问不问）。故意不放 config —— 只对本轮对话有效，
+        # 新对话/重启自动回严格，避免"哪天放权忘了关，之后一直裸奔"
+        self.perm = perm.Permission()
+        self._init_ui_tree()
+        self._init_finish()
+
+    def _init_state_and_config(self):
+        """基础状态/定时器 + 读取配置 + 养成·回忆引擎 + 饱食度巡检"""
+        self.current = 'flash'
+        self.pet_size = 260
+        self.pet_opacity = 1.0
+        self.dragging = False
+        self.drag_offset = QPoint()
+        self.sleeping = False
+        self.state = 'idle'          # idle / thinking / happy
+        self.phase = 0
+        self.base_x = None
+        self.base_y = None
+        self.type_timer = QTimer(self)
+        self.type_timer.timeout.connect(self._type_next)
+        self.type_buffer = ''
+        self.type_index = 0
+        # v6.60 气泡节奏与队列（拟人化：思考停顿 / 标点停顿 / 排队不覆盖 / 悬停暂停）
+        self._speak_busy = False      # 当前是否正在显示一条
+        self._speak_queue = []        # 排队中的下几条：(文本, immediate)
+        self._speak_think_ticks = 0   # “思考”阶段的点数计数
+        self._bubble_hover_paused = False
+        # v6.60 批 3：关心气泡（独立外观 + 可点开接话 + 回忆日志留痕）
+        self._bubble_mode = 'say'     # 'say' 普通说话 / 'care' 关心
+        self._care_click_text = ''    # 当前关心文本（点一下展开到聊天）
+        self._care_kind = 'care'      # care / remind / greet
+        self._dock_rehide = False     # 扒边探头后待收回
+        # v6.60 批 4：关心节流与场景触发状态
+        self._care_last_at = 0                 # 上次关心的时刻（冷却用）
+        self._care_today = None                # {'date': 'YYYY-MM-DD', 'n': 当日次数}
+        self._fg_cat = ''                      # 上次采样的前台程序类别
+        self._fg_break_at = 0                  # 从「专注」切到「不表态」的时刻
+        self._scene_used = True                # 本次休息间隙是否已用过
+        self._last_care_line = ''              # 上一条兜底措辞（避免重复）
+        self.chat_type_timer = QTimer(self)  # 聊天面板打字机（AI 回复流式显示）
+        self.chat_type_timer.timeout.connect(self._chat_type_tick)
+        self.chat_type_buffer = ''
+        self.chat_type_index = 0
+        self.click_times = []
+        self.thinking_timer = None
+        self._emotion_restore_timer = None  # 情绪立绘恢复定时器（10 秒）
+        self.bubble_hide_timer = QTimer(self)
+        self.bubble_hide_timer.setSingleShot(True)
+        self.bubble_hide_timer.timeout.connect(self._hide_bubble)
+        self.ai_enabled = False
+        self.display_mode = 'static'  # static/live2d（_load_ai_config 会覆盖）
+        self.live2d_model = 'mao'
+        self._load_ai_config()
+        self._read_appearance_cfg()   # v6.81：人物大小 / 透明度
+        self.app_aliases = self._load_aliases()
+        # v6.30 好感度与成长系统（引擎 + 回忆日志）
+        self.affection = AffectionEngine(AFFECTION_PATH)
+        self.memories = MemoryEvents(MEMORIES_PATH)
+        self._relation_dialog = None
+        self._game_window = None
+        self._pending_choices = None   # v6.30 情感选项
+        self._choices_requested = False
+        # v6.30 饱食度巡检（每 5 分钟，低饱食提示）
+        self._satiety_timer = QTimer(self)
+        self._satiety_timer.timeout.connect(self._check_satiety)
+
+    def _init_signals_and_hotkeys(self):
+        """跨线程信号连接 + 全局快捷键注册"""
+        self._satiety_timer.start(5 * 60 * 1000)
+        self.cost_bubble_signal.connect(self._on_cost_bubble)
+        self.balance_signal.connect(self._on_balance_result)   # v6.61 余额查询回主线程
+        self._last_satiety_warn = 0.0
+        # v6.40 真流式：信号连接
+        self.stream_signal.connect(self._on_stream)
+        self.reasoning_signal.connect(self._on_reasoning)
+        self.stream_done_signal.connect(self._on_stream_done)
+        self._stream_active = False
+        self._stream_rendered = False
+        self._stream_text = ''
+        self._stream_label = None
+        self._thinking_label = None
+        # AI 回复信号（类级定义，connect 跨线程槽）
+        self.ai_reply_signal.connect(self._display_ai_reply)
+        self.ai_status_signal.connect(self._update_ai_status)
+        self.wakeup_signal.connect(self._display_wakeup)
+        self.confirm_signal.connect(lambda fn: fn())  # 确认回调在主线程执行
+        self.ui_call_signal.connect(lambda fn: fn())  # v6.58 通用回主线程通道（跨线程安全）
+        # 全局快捷键 Ctrl+Alt+P 呼出 / Ctrl+Alt+S 截图 OCR
+        self._hotkey_installed = False
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                self._hotkey_filter = pl.hotkey_filter({1: self._on_global_hotkey, 2: self._on_screenshot_hotkey})
+                app.installNativeEventFilter(self._hotkey_filter)
+                if pl.register_hotkey(1, pl.MOD_CONTROL | pl.MOD_ALT, 0x50):  # MOD_CONTROL|MOD_ALT, 'P'
+                    self._hotkey_installed = True
+                try:
+                    pl.register_hotkey(2, pl.MOD_CONTROL | pl.MOD_ALT, 0x44)  # Ctrl+Alt+D 截图 OCR
+                except Exception as _exc:
+                    _silent_log('__init__:386', _exc)   # v6.54
+        except Exception:
+            self._hotkey_installed = False
+
+    def _init_services_and_data(self):
+        """对话记忆/用量统计/MCP/插件/主题 + 记忆·待办·提醒加载 + 贴边与主动说话"""
+        # 对话记忆 + 定时提醒 + 贴边
+        self.chat_history_msgs = []
+        self.display_msgs = []
+        self.api_stats = ApiStats(os.path.join(BASE_DIR, 'api_stats.json'), config_path=CONFIG_PATH,
+                                  registry=MODEL_REGISTRY)  # v6.18 API 自监控（价格表改读模型档案）
+        self._files_cache = FilesCache(os.path.join(BASE_DIR, 'files_cache.json'))  # v6.62 Files API
+        self._last_turn_reasoning = None   # v6.62 上一轮思考内容（带 tools 时回传）
+        # v6.66：离线语音输入（WinRT，单句识别；点 🎤 开始，识别结果只填输入框不自动发）
+        self.asr = AsrEngine(BASE_DIR, lang=str(getattr(self, 'asr_lang', 'zh-CN') or 'zh-CN'))
+        # v6.77：可插拔后端（auto / winh / whisper / http）+ 各后端需要的配置
+        _asr_cfg = {
+            'backend_name': str(getattr(self, 'asr_backend', 'auto') or 'auto'),
+            'whisper_exe': str(getattr(self, 'asr_whisper_exe', '') or ''),
+            'whisper_model': str(getattr(self, 'asr_whisper_model', '') or ''),
+            'asr_http_url': str(getattr(self, 'asr_http_url', '') or ''),
+            'asr_http_key': str(getattr(self, 'asr_http_key', '') or ''),
+            'record_seconds': int(getattr(self, 'asr_record_seconds', 6) or 6),
+            'winh_hotkey': str(getattr(self, 'asr_winh_hotkey', 'win+h') or 'win+h'),
+        }
+        for _k, _v in _asr_cfg.items():
+            try:
+                setattr(self.asr, _k, _v)
+            except Exception:
+                pass
+        self._listening = False
+        # v6.63：语音朗读（P0）—— 默认关闭；系统声线（WinRT/SAPI 慧慧那套）v6.94 起默认关
+        self.voice = VoiceIO(BASE_DIR, enabled=bool(getattr(self, 'voice_enabled', False)),
+                             engine=str(getattr(self, 'voice_engine', 'auto') or 'auto'),
+                             voice=str(getattr(self, 'voice_name', '') or ''),
+                             night_quiet=bool(getattr(self, 'voice_night_quiet', True)),
+                             local_url=str(getattr(self, 'voice_local_url', '') or ''),
+                             local_ref=str(getattr(self, 'voice_local_ref', '') or ''),
+                             local_prompt=str(getattr(self, 'voice_local_prompt', '') or ''),
+                             max_chars=int(getattr(self, 'voice_max_chars', 1200) or 1200),
+                             allow_system_tts=bool(getattr(self, 'voice_allow_system_tts', False)),
+                             rate=str(getattr(self, 'voice_rate', '') or ''))   # v6.76 语速
+        # v6.94：老配置里存的是系统声线（offline:Huihui）→ 当场换成自然声线，别等下次朗读才发现
+        try:
+            self._migrate_system_voice()
+        except Exception as _exc:
+            _silent_log('__init__:migrate_voice', _exc)
+        # v6.76：「朗读内容」策略（summary 要点优先 / full 全文 / manual 只念选中的）
+        self._voice_summary = ''
+        self.voice_content_mode = str(getattr(self, 'voice_content_mode', 'summary') or 'summary')
+        # v6.62：峰谷计价要认法定节假日（表内置，可从公共静态 JSON 年度更新，不花搜索额度）
+        ApiStats.HOLIDAYS_CACHE = os.path.join(BASE_DIR, 'holidays_cache.json')
+        self._maybe_update_holidays()
+        self._api_stats_win = None
+        # v6.61：余额查询（低余额提醒阈值可在设置里手改；自动刷新间隔默认 10 分钟）
+        self.balance_low_threshold = self.BALANCE_LOW_DEFAULT
+        self.balance_auto_minutes = 10
+        self._balance_busy = False
+        self._balance_alerted = ''
+        self.mcp = McpBridge(CONFIG_PATH)  # v6.20 MCP 桥接：后台连接配置的 MCP server
+        self.mcp.connect_all()
+        self.plugin_mgr = PluginManager(os.path.join(BASE_DIR, 'plugins'))  # v6.21 插件管理器
+        self.current_theme = 'default'  # v6.23 主题系统：default / theme 插件名
+        self.theme = dict(DEFAULT_THEME)
+        self._pending_attachments = []  # 统一附件暂存（除 Ctrl+Alt+D 全局截图外，文件/图片先暂存）      # 聊天面板显示历史（含系统提示/提醒/唤醒，供回显与导出）
+        # v6.79 fix：AI 任务队列/忙碌标记必须在构造时就存在。
+        # 原先只在“排队/重排”时才赋值，于是 _ai_worker 收尾调用 _next_task() 抛
+        # AttributeError: 'PetWidget' object has no attribute '_task_queue'
+        # —— 表现为：AI 回完话日志里刷一条错误、忙碌时发的消息直接崩、排队任务永不执行。
+        self._task_queue = []
+        self._ai_busy = False
+        self._ai_generation = 0
+        self._cur_gen = -1
+        self._cur_task_text = None
+        self._pending_resume = False
+        self.personality = '温柔'
+        self.memory_facts = []      # 长期事实记忆
+        self.memory_summaries = []  # 会话摘要
+        self._load_memory()
+        self.todos = []             # 待办清单
+        self._load_todos()
+        self._load_chat_memory()
+        self._display_offset = 0   # 显示历史已加载起点（显示更多用）
+        self.reminders = []
+        self._load_reminders()      # 加载持久化提醒（含关机期间错过的补发）
+        self.reminder_timer = QTimer(self)
+        self.reminder_timer.timeout.connect(self._check_reminders)
+        self.reminder_timer.start(1000)
+        self._edge_docked = False
+        self._edge_side = None
+        self._edge_popped = False
+        # 主动说话（v6.17）：随机间隔 8-20 分钟冒泡一句
+        self.active_chat_enabled = False
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as _f:
+                self.active_chat_enabled = bool(json.load(_f).get('active_chat', False))
+        except Exception:
+            self.active_chat_enabled = False
+        self._active_chat_next = time.time() + random.uniform(480, 1200)
+        self.active_chat_timer = QTimer(self)
+        self.active_chat_timer.timeout.connect(self._check_active_chat)
+        self.active_chat_timer.start(30000)  # 每 30 秒检查一次
+        # v6.95：异地天气突变（30 分钟看一次；启动 90 秒后先看一次）
+        self._ld_svc = None
+        self._ld_busy = False
+        self.ld_weather_timer = QTimer(self)
+        self.ld_weather_timer.timeout.connect(self._check_long_distance_weather)
+        self.ld_weather_timer.start(30 * 60 * 1000)
+        QTimer.singleShot(90 * 1000, self._check_long_distance_weather)
+        # v6.61：扒边探头开关（默认「关」：扒边时只冒气泡，不把整个人弹出来）
+        self.dock_probe = False
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as _f:
+                self.dock_probe = bool(json.load(_f).get('dock_probe', False))
+        except Exception:
+            self.dock_probe = False
+        # v6.61：探头看门狗（探头后若一直没说出话 → 强制收回扒边，防卡在弹出态）
+        self._probe_timer = QTimer(self)
+        self._probe_timer.setSingleShot(True)
+        self._probe_timer.timeout.connect(self._probe_watchdog)
+        self._popup_y = 0
+        self._popup_x = 0
+        self._chat_hidden_for_dock = False
+
+    def _init_ui_tree(self):
+        """窗口标志 + 布局 + 气泡 + 立绘 + 聊天面板 + 任务侧栏 + 菜单"""
+        self._edge_mode = 'peek'   # 'peek'=扒边模式(默认) / 'hidden'=完全消失模式
+
+        pl.apply_pet_window(self)   # v6.72 批次2：窗口标志收口到平台抽象层（等值搬迁）
+        self.setFixedSize(440, 560)
+        # 窗口透明由 DPI awareness + WA_TranslucentBackground 保证（不再需要手工清边框）
+
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+        self.bubble = QLabel(self)
+        self.bubble.setWordWrap(True)
+        self.bubble.setAlignment(Qt.AlignCenter)
+        # v6.58 主题化：初值也走主题（与切主题时同一条规则）
+        pb.apply_say_bubble_theme(self.bubble, self.theme)
+        self.bubble.setMaximumWidth(400)
+        self.bubble.setMaximumHeight(220)
+        # 气泡不参与布局排版（悬浮定位，避免挤压控制栏导致上下跳动）
+        self.bubble.setParent(self)
+        self.bubble.hide()
+        # v6.60：悬停暂停——鼠标移上去就不再自动隐藏（也不再打字），
+        # 否则短气泡一闪而过，主动关心说了等于没说
+        self.bubble.enterEvent = lambda e: self._bubble_hover(True)
+        self.bubble.leaveEvent = lambda e: self._bubble_hover(False)
+        # v6.60 批 3：点关心气泡 → 展开到聊天（普通气泡点击无副作用）
+        self.bubble.mousePressEvent = self._bubble_clicked
+        self._init_status_bar()   # v6.60 批 2：底部系统状态条
+
+        self.pet_label = QLabel(self)
+        self.pet_label.setAlignment(Qt.AlignCenter)
+        self.pet_label.setFixedSize(self.pet_size, self.pet_size)
+        # 显示模式容器：静态立绘 / Live2D 可切换
+        from PySide6.QtWidgets import QStackedWidget
+        self.pet_stack = QStackedWidget(self)
+        self.pet_stack.addWidget(self.pet_label)
+        self.layout.addWidget(self.pet_stack, 0, Qt.AlignHCenter)
+
+        # 聊天窗口（替代原功能按钮栏）
+        self.chat_panel = QFrame(self)
+        self.chat_panel.setStyleSheet(self._panel_qss())  # v6.23 主题变量化样式
+        chat_layout = QVBoxLayout(self.chat_panel)
+        chat_layout.setContentsMargins(8, 4, 8, 8)
+        chat_layout.setSpacing(6)
+
+        # v6.77 折叠：标题栏常驻，正文（历史/侧栏/输入）收进 self.chat_body 容器
+        self.chat_header = QWidget(self.chat_panel)
+        header_row = QHBoxLayout(self.chat_header)
+        header_row.setContentsMargins(2, 0, 2, 0)
+        header_row.setSpacing(4)
+        self.chat_title = QLabel('💬 对话', self.chat_header)
+        self._set_themed_qss(self.chat_title,
+                             lambda: f"color:{self._tk('ui_text_soft')}; font-size:11px;")
+        header_row.addWidget(self.chat_title, 1)
+        # v6.81：人物大小 / 透明度调节入口（标题栏常驻，折叠时也能点）
+        self.chat_style_btn = QLabel('🎨', self.chat_header)
+        self._set_themed_qss(self.chat_style_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:12px; padding:2px 4px; cursor:pointer;")
+        self.chat_style_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_style_btn.setToolTip(self._t('pet_style_tip'))
+        self.chat_style_btn.mousePressEvent = lambda e: self._open_appearance_dialog()
+        header_row.addWidget(self.chat_style_btn, 0)
+        # v6.82：音乐入口（跟 🎨 并排，标题栏常驻，折叠时也能点）
+        self.chat_music_btn = QLabel('🎵', self.chat_header)
+        self._set_themed_qss(self.chat_music_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:12px; padding:2px 4px; cursor:pointer;")
+        self.chat_music_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_music_btn.setToolTip(self._t('music_tip'))
+        self.chat_music_btn.mousePressEvent = lambda e: self.open_music_panel()
+        header_row.addWidget(self.chat_music_btn, 0)
+        # v6.85：下载入口（跟 🎵 并排，标题栏常驻，折叠时也能点）
+        self.chat_dl_btn = QLabel('⬇', self.chat_header)
+        self._set_themed_qss(self.chat_dl_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:12px; padding:2px 4px; cursor:pointer;")
+        self.chat_dl_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_dl_btn.setToolTip(self._t('dl_tip'))
+        self.chat_dl_btn.mousePressEvent = lambda e: self.open_download_panel()
+        header_row.addWidget(self.chat_dl_btn, 0)
+        # v6.86：文件转换入口（跟 ⬇ 并排，标题栏常驻，折叠时也能点）
+        self.chat_cv_btn = QLabel('⇄', self.chat_header)
+        self._set_themed_qss(self.chat_cv_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:12px; padding:2px 4px; cursor:pointer;")
+        self.chat_cv_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_cv_btn.setToolTip(self._t('cv_tip'))
+        self.chat_cv_btn.mousePressEvent = lambda e: self.open_convert_panel()
+        header_row.addWidget(self.chat_cv_btn, 0)
+        # v6.88：见面照片墙入口（跟 ⇄ 并排，标题栏常驻，折叠时也能点）
+        # 带「照片」两个字：光一个 📷 在 12px 里又小又暗，实测自己都一眼扫不到
+        self.chat_pw_btn = QLabel(self._t('pw_btn'), self.chat_header)
+        self._set_themed_qss(self.chat_pw_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:11px; padding:2px 4px; cursor:pointer;")
+        self.chat_pw_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_pw_btn.setToolTip(self._t('pw_tip'))
+        self.chat_pw_btn.mousePressEvent = lambda e: self.open_photo_wall()
+        header_row.addWidget(self.chat_pw_btn, 0)
+        # v6.89：记账入口（跟 📷 照片 并排；单字符 ¥ 才塞得下，标题栏已经很挤了）
+        self.chat_lg_btn = QLabel('¥', self.chat_header)
+        self._set_themed_qss(self.chat_lg_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:12px; padding:2px 4px; cursor:pointer;")
+        self.chat_lg_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_lg_btn.setToolTip(self._t('lg_tip'))
+        self.chat_lg_btn.mousePressEvent = lambda e: self.open_ledger()
+        header_row.addWidget(self.chat_lg_btn, 0)
+        # v6.80：新对话按钮（标题栏常驻，折叠时也能点）
+        # 为什么放在标题栏：历史攒多了又滚不完，用户想要的是“一键重开”，
+        # 不必先打 /clear 或者进菜单翻。旧对话会自动存档，所以不弹确认框。
+        self.chat_new_btn = QLabel(self._t('new_chat'), self.chat_header)
+        self._set_themed_qss(self.chat_new_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:11px; padding:2px; cursor:pointer;")
+        self.chat_new_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_new_btn.setToolTip(self._t('new_chat_tip'))
+        self.chat_new_btn.mousePressEvent = lambda e: self._new_conversation()
+        header_row.addWidget(self.chat_new_btn, 0)
+        self.chat_fold_btn = QLabel('▾ 收起', self.chat_header)
+        self._set_themed_qss(self.chat_fold_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:11px; padding:2px; cursor:pointer;")
+        self.chat_fold_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_fold_btn.mousePressEvent = lambda e: self._toggle_chat_fold()
+        header_row.addWidget(self.chat_fold_btn, 0)
+        chat_layout.addWidget(self.chat_header)
+
+        self.chat_body = QWidget(self.chat_panel)
+        body_layout = QVBoxLayout(self.chat_body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(6)
+        chat_layout.addWidget(self.chat_body, 1)
+
+        # 聊天历史（只读）
+        self.chat_more_btn = QLabel('📜 显示更多历史', self.chat_panel)
+        self._set_themed_qss(self.chat_more_btn,
+                             lambda: f"color:{self._tk('accent')}; font-size:11px; padding:2px; cursor:pointer;")
+        self.chat_more_btn.setAlignment(Qt.AlignCenter)
+        self.chat_more_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_more_btn.mousePressEvent = lambda e: self._load_more_history()
+        self.chat_more_btn.hide()
+        body_layout.addWidget(self.chat_more_btn)
+        self.chat_history_scroll = QScrollArea(self.chat_panel)
+        self.chat_history_scroll.setWidgetResizable(True)
+        self.chat_history_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.chat_history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_history_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.chat_history_container = QWidget()
+        # v6.81：容器起个名字，主题里给它 transparent —— 不然清空消息后露出的
+        # 是 QWidget/QScrollArea viewport 的调色板底色（白色），整块面板像坏掉一样
+        self.chat_history_container.setObjectName('chatHistoryBox')
+        self.chat_history_container.setAutoFillBackground(False)
+        self.chat_history_layout = QVBoxLayout(self.chat_history_container)
+        self.chat_history_layout.setContentsMargins(2, 2, 4, 2)
+        self.chat_history_layout.setSpacing(8)
+        self.chat_history_layout.addStretch(1)  # 底部弹簧：消息从顶部排、滚动贴底
+        self.chat_history_scroll.setWidget(self.chat_history_container)
+        # v6.81：viewport 也要透明，否则滚动区底色仍是白色
+        try:
+            self.chat_history_scroll.viewport().setObjectName('chatHistoryViewport')
+            self.chat_history_scroll.viewport().setAutoFillBackground(False)
+        except Exception as _exc:
+            _silent_log('chat_history_viewport:605', _exc)
+        self._status_widget = None  # 当前状态行（⏳/思考中）
+
+        # ===== v6.65 右侧信息栏：多页签（任务/状态/花费/待办/便签/系统）+ 可增删改 + 可折叠 =====
+        # 原先只放任务队列，空着也占 1/3 宽 —— 改成“一栏多用”，并把页签做成可自定义
+        self._side_cfg = self._read_side_cfg()
+        self.side_panel = SidePanel(
+            self.chat_panel,
+            tabs=self._side_cfg.get('tabs'),
+            collapsed=self._side_cfg.get('collapsed', False),
+            save_cb=self._save_side_panel,
+            data_cb=self._side_panel_data,
+            theme_qss=lambda: (
+                'QFrame{background:%s;border-radius:8px;}'
+                'QLabel{color:%s;font-size:10.5px;}'
+                'QListWidget{background:%s;color:%s;border:none;font-size:11px;}'
+                'QPlainTextEdit{background:%s;color:%s;border:none;font-size:11px;}'
+                'QTabBar::tab{background:%s;color:%s;padding:3px 7px;border-radius:5px;'
+                'margin-right:2px;font-size:10px;}'
+                'QTabBar::tab:selected{background:%s;}'
+                % (self._solid(self._tk('ui_popup_bg')), self._tk('ui_text_dim'),
+                   self._solid(self._tk('ui_popup_list_bg')), self._tk('ui_text'),
+                   self._solid(self._tk('ui_popup_list_bg')), self._tk('ui_text'),
+                   self._solid(self._tk('ui_popup_btn_bg')), self._tk('ui_text_soft'),
+                   self._tk('ui_accent'))))
+        # 兼容旧接线（宿主别处仍用这几个名字）
+        self.chat_task_sidebar = self.side_panel
+        self.task_collapse_btn = self.side_panel.collapse_btn
+        self.task_list = self.side_panel._tasks_list
+        self.side_panel.collapse_btn.clicked.connect(self._toggle_task_sidebar)
+        self.side_panel._task_hooks['dblclick'] = self._cancel_queued_task
+        self.side_panel._task_hooks['reorder'] = self._on_task_reorder
+        self.side_panel._note_save = lambda: self._save_side_panel(
+            self.side_panel.dump_tabs(), self.side_panel.collapsed)
+        self._side_start_ts = time.time()
+        # v6.66 fix：删掉旧版遗留的常驻任务把手（chat 与侧栏之间那个 22×40 的 📋 方块）——
+        # 它与侧栏自带的 ◀/▶ 按钮功能重叠，使用者反馈“折叠后多出个像任务栏的按钮”，只保留 ▶。
+        chat_cols = QHBoxLayout()
+        chat_cols.setSpacing(6)
+        chat_cols.addWidget(self.chat_history_scroll, 1)
+        chat_cols.addWidget(self.chat_task_sidebar, 0)
+        body_layout.addLayout(chat_cols, 1)
+
+        # 输入框（多行自适应：内容多自动增高，超上限内部滚动）
+        self.chat_input = _DropChatEdit(self._insert_dropped_paths, self.chat_panel)
+        self.setAcceptDrops(True)  # 主窗口级拖放兜底（文件路径插入输入框）
+        self.chat_input.setPlaceholderText(self._t('chat_placeholder'))
+        self.chat_input.setAcceptRichText(False)  # 粘贴/拖入自动转纯文本，避免富文本格式污染背景
+        self.chat_input.setFixedHeight(34)
+        self.chat_input.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.chat_input.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_input.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.chat_input.document().contentsChanged.connect(self._auto_resize_input)
+        self.chat_input.installEventFilter(self)
+        self.chat_attach_btn = QPushButton('📎', self.chat_panel)
+        self.chat_attach_btn.setFixedSize(30, 34)
+        self.chat_attach_btn.setToolTip(self._t('attach_tip') if hasattr(self, '_t') else '附加文件')
+        self.chat_attach_btn.setCursor(Qt.PointingHandCursor)
+        self.chat_attach_btn.clicked.connect(self._pick_attach_files)
+        # 附件暂存栏（输入框上方，卡片形式）
+        self.attach_bar = QWidget(self.chat_panel)
+        self.attach_bar_layout = QHBoxLayout(self.attach_bar)
+        self.attach_bar_layout.setContentsMargins(0, 2, 0, 2)
+        self.attach_bar_layout.setSpacing(6)
+        self.attach_bar_layout.addStretch(1)
+        self.attach_bar.hide()
+        body_layout.addWidget(self.attach_bar)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(4)
+        # v6.91：权限档位（放不放权）—— 输入框左边，跟 🎤 📎 一排。
+        # 为什么不放标题栏：标题栏已经 9 个控件挤成一排（🎨🎵⬇⇄照片¥ 新对话 收起），
+        # 再塞一个单字符就得把「照片」缩回 📷；输入框这排空间宽松，而且天天看得见。
+        self.perm_btn = QPushButton(perm.ICON[perm.STRICT], self.chat_panel)
+        self.perm_btn.setFixedSize(30, 30)
+        self.perm_btn.setCursor(Qt.PointingHandCursor)
+        self._set_themed_qss(self.perm_btn, lambda: (
+            'QPushButton{background:%s;color:%s;border:none;border-radius:6px;font-size:13px;}'
+            'QPushButton:hover{background:%s;}'
+            % (self._tk('ui_popup_btn_bg'),
+               self._tk(perm.COLOR_TOKEN.get(self.perm.level, 'ui_text_soft')),
+               self._tk('ui_popup_btn_hover'))))
+        self.perm_btn.clicked.connect(self._perm_menu)
+        self._apply_perm_btn()
+        input_row.addWidget(self.perm_btn)
+        input_row.addWidget(self.chat_input, 1)
+        # v6.66：语音输入按钮（点一下开始听 → 离线识别 → 填进输入框，不自动发送）
+        self.mic_btn = QPushButton('🎤', self.chat_panel)
+        self.mic_btn.setFixedSize(30, 30)
+        self.mic_btn.setCursor(Qt.PointingHandCursor)
+        self.mic_btn.setToolTip('语音输入（离线识别；再点一次取消）')
+        self._set_themed_qss(self.mic_btn, lambda: (
+            'QPushButton{background:%s;color:%s;border:none;border-radius:6px;font-size:13px;}'
+            'QPushButton:hover{background:%s;}'
+            % (self._tk('ui_popup_btn_bg'), self._tk('ui_text_soft'), self._tk('ui_popup_btn_hover'))))
+        self.mic_btn.clicked.connect(self._toggle_listen)
+        input_row.addWidget(self.mic_btn)
+        # v6.93：朗读暂停键（念到一半想停一下就点它；再点继续接着念）
+        self.voice_pause_btn = QPushButton('⏸', self.chat_panel)
+        self.voice_pause_btn.setFixedSize(30, 30)
+        self.voice_pause_btn.setCursor(Qt.PointingHandCursor)
+        self.voice_pause_btn.setToolTip('暂停朗读（再点一下继续）')
+        self._set_themed_qss(self.voice_pause_btn, lambda: (
+            'QPushButton{background:%s;color:%s;border:none;border-radius:6px;font-size:13px;}'
+            'QPushButton:hover{background:%s;}'
+            'QPushButton:disabled{color:%s;}'
+            % (self._tk('ui_popup_btn_bg'), self._tk('ui_text_soft'),
+               self._tk('ui_popup_btn_hover'), self._tk('ui_text_dim'))))
+        self.voice_pause_btn.clicked.connect(self._toggle_voice_pause)
+        input_row.addWidget(self.voice_pause_btn)
+        # 朗读状态每 0.4 秒对一眼（只在变化时才动控件，不刷界面）
+        self._voice_pause_timer = QTimer(self)
+        self._voice_pause_timer.setInterval(400)
+        self._voice_pause_timer.timeout.connect(self._apply_voice_pause_btn)
+        self._apply_voice_pause_btn()
+        self._voice_pause_timer.start()
+        input_row.addWidget(self.chat_attach_btn)
+        body_layout.addLayout(input_row)
+
+        self.layout.addWidget(self.chat_panel, 0, Qt.AlignHCenter)
+        self.chat_panel.setFixedWidth(420)
+        self.chat_panel.setFixedHeight(240)
+        # v6.77：折叠状态（记住上次）+ 折叠期间用的云朵提示框
+        self._chat_folded = self._read_chat_folded()
+        self._chat_panel_h = self.chat_panel.height()
+        self.cloud = CloudBubble(self)
+        self.cloud.hide()
+        self.cloud.mousePressEvent = lambda e: self._cloud_clicked()
+        self.cloud_hide_timer = QTimer(self)
+        self.cloud_hide_timer.setSingleShot(True)
+        self.cloud_hide_timer.timeout.connect(self._hide_cloud_hint)
+        self._apply_cloud_theme()
+        if self._chat_folded:
+            self._apply_chat_fold(True)
+        self._chat_dragging = False
+        self._chat_drag_mode = None   # None / 'h'（左/右边）/ 'v_bottom'（下边）/ 'corner_bl'/'corner_br'（下两角）
+        self._chat_drag_side = None   # 'left' / 'right'（水平拖拽方向）
+        self._chat_drag_start_y = 0
+        self._chat_drag_start_h = 0
+        self._chat_drag_start_x = 0
+        self._chat_drag_start_w = 0
+        # 边缘/下角拖拽（把手已全部移除 v6.19c：顶部 v6.19b 移除，底部 v6.19c 移除，改用边缘+下角）
+        self.chat_panel.setMouseTracking(True)
+        self.chat_panel.mousePressEvent = self._chat_panel_press
+        self.chat_panel.mouseMoveEvent = self._chat_panel_move
+        self.chat_panel.mouseReleaseEvent = self._chat_panel_release
+
+
+    def _init_finish(self):
+        """动画/问候/眨眼/打盹日报/历史回显/显示模式应用"""
+        # 动画定时器 ~30fps
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.animate)
+        self.timer.start(33)
+
+        self.greet_timer = QTimer(self)
+        self.greet_timer.timeout.connect(self.say_random)
+        QTimer.singleShot(90000, self._schedule_greet)
+
+        self.load_character('flash')
+        # v6.81：先落到存档里的人物大小 / 透明度，再定位窗口（否则位置钳制会按旧尺寸算）
+        try:
+            self._apply_pet_size(getattr(self, 'pet_size', self.PET_SIZE_DEFAULT),
+                                 save=False, keep_bottom=False)
+            self._apply_pet_opacity(getattr(self, 'pet_opacity', 1.0), save=False)
+        except Exception as _exc:
+            _silent_log('_init_finish:appearance', _exc)
+        self._sync_window_to_panel()   # v6.81：窗口尺寸按人物大小算（不再写死 320）
+        self._restore_position()
+
+        # 眨眼调度
+        self.blink_timer = QTimer(self)
+        self.blink_timer.timeout.connect(self._do_blink)
+        self.blink_timer.start(random.randint(8000, 15000))
+        self._blinking = False
+
+        # 输入感知（打盹/久坐/光标跟随）+ 早安日报
+        self._start_idle_system()
+        self._start_morning_report()
+
+        # v6.85：剪贴板里的视频链接要能被捡到（这就是「一键下载」的入口）。
+        # 只连一个 dataChanged 信号，不起进程，所以放启动时做也不心疼；
+        # config.json 里 dl_watch=false 就完全不连。
+        try:
+            import pet_download_ui
+            self._download = pet_download_ui.DownloadController(self)
+            self._download.notice.connect(lambda t: self._notify(t))
+            self._download.start_watching_if_needed()
+        except Exception as _exc:
+            _silent_log('_init_finish:download', _exc)
+        # v6.58：恢复上次主题（必须早于历史回显，回显出的气泡才会用上主题色）
+        self._restore_saved_theme()
+        self._echo_display_history()  # 面板已就绪，回显上次会话历史
+        self.weather_signal.connect(self._on_weather_result)
+        self.ocr_signal.connect(self._on_ocr_result)
+        # 应用显示模式（config 为 live2d 时直接启用，不弹提示）
+        if getattr(self, 'display_mode', 'static') == 'live2d':
+            w = self._create_l2d_embedded()
+            if w is not None:
+                self.pet_stack.addWidget(w)
+                self._l2d_widget = w
+                self.pet_stack.setCurrentWidget(w)
+                self.bubble.raise_()
+            else:
+                self.display_mode = 'static'
+
+
+    # ---------- 窗口 ----------
+    def _restore_position(self):
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                x, y = cfg.get('x'), cfg.get('y')
+                if x is not None and y is not None:
+                    # v6.51 多显示器修正：原先只拿 primaryScreen 判界、且把 x<0 一律当越界，
+                    # 副屏在主屏左侧时（x 恒为负）每次启动都被强行拉回主屏。
+                    # 现在先问"这个坐标落在哪块屏幕"，再在该屏工作区内钳制窗口。
+                    scr = None
+                    try:
+                        scr = QApplication.screenAt(QPoint(int(x), int(y)))
+                    except Exception:
+                        scr = None
+                    if scr is not None:
+                        avail = scr.availableGeometry()
+                        x = max(avail.left() - 4, min(int(x), avail.right() - self.width() + 8))
+                        y = max(avail.top() - 4, min(int(y), avail.bottom() - self.height() + 8))
+                        self.move(x, y)
+                        self.base_x, self.base_y = x, y
+                        return
+        except Exception as _exc:
+            _silent_log('_restore_position:653', _exc)   # v6.54
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()   # v6.51：改用工作区，避免压到任务栏
+            self.move(avail.right() - self.width() - 40, avail.bottom() - self.height() - 60)
+            self.base_x, self.base_y = self.x(), self.y()
+
+    @staticmethod
+    def _atomic_write_json(path, data, pretty=True):
+        """原子写 JSON（委托 pet_storage.atomic_write_json，P1 模块化）"""
+        _atomic_write_json_impl(path, data, pretty)
+
+    def _save_position(self):
+        """保存位置，同时保留已有配置（api key 等不被覆盖）"""
+        try:
+            cfg = {}
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    try:
+                        cfg = json.load(f)
+                    except Exception:
+                        cfg = {}
+            cfg['x'] = self.x()
+            cfg['y'] = self.y()
+            self._atomic_write_json(CONFIG_PATH, cfg)
+        except Exception as _exc:
+            _silent_log('_save_position:679', _exc)   # v6.54
+
+    def _schedule_greet(self):
+        self.greet_timer.start(random.randint(*GREET_INTERVAL))
+
+    # ---------- AI 对话 ----------
+    def _t(self, key):
+        """取当前语言的 UI 文本"""
+        d = UI_EN if getattr(self, 'language', 'zh') == 'en' else UI_ZH
+        return d.get(key, UI_ZH.get(key, key))
+
+    def _load_ai_config(self):
+        """读取 AI 配置：模型身份（模型 ID/显示名/参数）取自 models.json 档案，其余取自 config.json"""
+        global CHARACTERS
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                self._cfg = cfg            # 供 _api_key_for_field 按字段名取 key
+                key = cfg.get('deepseek_api_key', '')
+                if key:
+                    self.ai_key = key
+                    self.ai_enabled = True
+                self.search_api_key = cfg.get('search_api_key', '')  # Tavily 联网搜索 key（可选）
+                self.pet_city = cfg.get('city', '重庆')
+                self.personality = cfg.get('personality', '温柔')
+                self.reply_style = cfg.get('reply_style', 'normal')  # short/normal/detailed
+                self.language = cfg.get('language', 'zh')  # zh/en
+                self.display_mode = cfg.get('display_mode', 'static')  # static/live2d
+                self.live2d_model = cfg.get('live2d_model', 'mao')  # Live2D 模型目录名
+                # v6.53：进阶工具模式（默认关 → 只放开 core 工具，省 token）
+                # v6.58：core 已补回“外观/自改/插件/文件”9 个（用户能直接要求的能力）
+                self.advanced_tools = bool(cfg.get('advanced_tools', False))
+                # v6.59：前台程序感知（默认关闭；开启后仅向唤醒判断附带「当前前台程序」信号）
+                self.foreground_aware = bool(cfg.get('foreground_aware', False))
+                # v6.61：扒边探头（默认关 → 扒边时只冒气泡；开 → 关心时整个人弹出来说，说完缩回）
+                self.dock_probe = bool(cfg.get('dock_probe', False))
+                # v6.61：余额（低余额阈值可手改；自动刷新间隔分钟）
+                try:
+                    self.balance_low_threshold = max(0.0, float(
+                        cfg.get('balance_low_threshold', self.BALANCE_LOW_DEFAULT) or 0))
+                except Exception:
+                    self.balance_low_threshold = self.BALANCE_LOW_DEFAULT
+                try:
+                    self.balance_auto_minutes = max(1, int(cfg.get('balance_auto_minutes', 10) or 10))
+                except Exception:
+                    self.balance_auto_minutes = 10
+                # v6.58：记住 config 里保存的主题名（启动时在 UI 就绪后恢复；此前只写不读 → 重启被重置）
+                self._saved_theme = str(cfg.get('theme') or 'default')
+                self._theme_widgets = []   # 受主题着色的控件登记表（切主题时统一刷新）
+                # 模型档案是模型身份的唯一来源：角色表每次从档案重建
+                # （改 models.json 即可改显示名/台词，无需动代码）
+                CHARACTERS = build_characters()
+                if CHARACTERS and getattr(self, 'current', 'flash') not in CHARACTERS:
+                    self.current = MODEL_REGISTRY.first_key()
+                prof = self._current_profile()
+                p_flash, p_pro = MODEL_REGISTRY.get('flash'), MODEL_REGISTRY.get('pro')
+                if p_flash is not None:
+                    self.model_flash = p_flash.model_id
+                if p_pro is not None:
+                    self.model_pro = p_pro.model_id
+                self.ai_model = self._current_model()
+                # 输出上限/思考开关/温度统一由档案提供
+                # （原先只看 config.json、菜单里没有入口，且上限三处互相矛盾）
+                if prof is not None:
+                    self.max_tokens = prof.max_tokens
+                    self.reasoning_enabled = prof.reasoning
+                    self.reasoning_effort = prof.effort      # v6.62 思考强度
+                    self.temperature = prof.temperature
+                    self.vision_enabled = prof.supports_vision   # v6.62 图片是否可直送模型
+                else:
+                    self.max_tokens = clamp_tokens(cfg.get('max_tokens', 1000))
+                    self.reasoning_enabled = cfg.get('reasoning', True)
+                    self.reasoning_effort = clamp_effort(cfg.get('effort', DEFAULT_EFFORT))
+                    self.temperature = float(cfg.get('temperature', 1.0))
+                    self.vision_enabled = bool(cfg.get('use_vision', True))
+                # v6.62：三项跨模型的 API 行为开关（全局 config.json）
+                self.pass_reasoning_history = bool(cfg.get('pass_reasoning_history', True))
+                self.strict_tools = bool(cfg.get('strict_tools', False))
+                self.vision_files_api = bool(cfg.get('vision_files_api', False))
+                self.holidays_auto_update = bool(cfg.get('holidays_auto_update', True))
+                # v6.63：语音朗读开关与声线（默认在线神经声线，离线作兜底）
+                self.voice_enabled = bool(cfg.get('voice_enabled', False))
+                self.voice_engine = str(cfg.get('voice_engine', 'auto') or 'auto')
+                self.voice_name = str(cfg.get('voice_name', '') or '')
+                self.voice_night_quiet = bool(cfg.get('voice_night_quiet', True))
+                # v6.94：系统声线（WinRT/SAPI：慧慧/瑶瑶/康康）默认关 —— 机械音，使用者要求关掉
+                self.voice_allow_system_tts = bool(cfg.get('voice_allow_system_tts', False))
+                # v6.64：本地自建 TTS 服务（自训练/克隆模型）
+                self.voice_local_url = str(cfg.get('voice_local_url', '') or '')
+                self.voice_local_ref = str(cfg.get('voice_local_ref', '') or '')
+                self.voice_local_prompt = str(cfg.get('voice_local_prompt', '') or '')
+                try:
+                    if getattr(self, 'voice', None) is not None:
+                        self.voice.set_config(enabled=self.voice_enabled, engine=self.voice_engine,
+                                              voice=self.voice_name, night_quiet=self.voice_night_quiet,
+                                              allow_system_tts=getattr(self, 'voice_allow_system_tts', False),
+                                              local_url=self.voice_local_url,
+                                              local_ref=self.voice_local_ref,
+                                              local_prompt=self.voice_local_prompt)
+                except Exception as _exc:
+                    _silent_log('_load_ai_config:voice', _exc)
+        except Exception as _exc:
+            _silent_log('_load_ai_config:734', _exc)   # v6.54
+
+    def _current_profile(self):
+        """当前角色对应的模型档案（档案缺失时回退第一份 / None）"""
+        prof = MODEL_REGISTRY.get(getattr(self, 'current', 'flash'))
+        if prof is None and len(MODEL_REGISTRY):
+            prof = MODEL_REGISTRY.profiles()[0]
+        return prof
+
+    def _current_endpoint(self):
+        """当前角色使用的接口地址（由档案提供，不再每个模块各写一份）"""
+        prof = self._current_profile()
+        return prof.endpoint if prof is not None else DEFAULT_ENDPOINT
+
+    def _api_key_for_field(self, field):
+        """按字段名从 config.json 取 key。
+
+        档案里的 api_key_field 决定这一份档案用哪把 key，因此同一台机器可以
+        让不同档案分别指向不同的服务商 / 中转（各配各的 key）；
+        该字段没配时回退到主 key deepseek_api_key。"""
+        field = (str(field or '') or 'deepseek_api_key').strip()
+        if field == 'deepseek_api_key':
+            return getattr(self, 'ai_key', '') or ''
+        cfg = getattr(self, '_cfg', None) or {}
+        return str(cfg.get(field) or '').strip() or (getattr(self, 'ai_key', '') or '')
+
+    def _current_api_key(self):
+        """当前角色该用哪把 key：由档案的 api_key_field 决定"""
+        prof = self._current_profile()
+        return self._api_key_for_field(
+            prof.api_key_field if prof is not None else 'deepseek_api_key')
+
+    def _current_model(self):
+        """按当前角色返回实际请求的模型 ID（取自档案；档案不可用时才回退旧字段）"""
+        prof = MODEL_REGISTRY.get(getattr(self, 'current', 'flash'))
+        if prof is not None and prof.model_id:
+            return prof.model_id
+        if self.current == 'pro':
+            return getattr(self, 'model_pro', 'deepseek-v4-pro')
+        return getattr(self, 'model_flash', 'deepseek-flash')
+
+    def _run_task(self, text, images=None):
+        """v6.43b：立即执行任务（分配代次 + 置 busy + 起线程）
+
+        v6.62：images 随任务一起带入（图片直送模型）
+        v6.79：**彻底移除日成本上限门**——调用不再因额度被中断或拦截
+        """
+        import threading as _th
+        # v6.79 · 成本上限已停用：这里不做任何额度检查，直接执行任务
+        self._ai_generation = getattr(self, '_ai_generation', 0) + 1
+        self._cur_task_text = text
+        self._ai_busy = True
+        try:
+            self._refresh_task_sidebar()
+        except Exception as _exc:
+            _silent_log('_run_task:784', _exc)   # v6.54
+        # v6.53：保留线程句柄，供 /stop 判断旧线程是否已退出（防抢跑）
+        self._ai_thread = _th.Thread(target=self._ai_worker, args=(text, images), daemon=True)
+        self._ai_thread.start()
+
+    def _enqueue_task(self, text, images=None):
+        """v6.43b：任务入队（FCFS）"""
+        import time as _time
+        self._task_queue.append({'text': text, 'images': images, 'ts': _time.time()})
+        try:
+            self._refresh_task_sidebar()
+        except Exception as _exc:
+            _silent_log('_enqueue_task:796', _exc)   # v6.54
+
+    def _next_task(self):
+        """v6.43b：空闲时执行队列下一个任务（先来先到）"""
+        try:
+            if self._task_queue and not getattr(self, '_ai_busy', False):
+                t = self._task_queue.pop(0)
+                self._run_task(t['text'], t.get('images'))
+            else:
+                if not self._task_queue:
+                    self._cur_task_text = None
+                try:
+                    self._refresh_task_sidebar()
+                except Exception as _exc:
+                    _silent_log('_next_task:810', _exc)   # v6.54
+        except Exception as _exc:
+            _silent_log('_next_task:812', _exc)   # v6.54
+
+    def _refresh_task_sidebar(self):
+        """v6.43b / v6.65：刷新右侧信息栏的「任务」页（首行 = 执行中，其后排队可拖拽）"""
+        try:
+            self.side_panel.refresh_tasks(self._cur_task_text, self._task_queue)
+        except Exception:
+            pass
+
+    # ---------- v6.65：信息栏页签的持久化与数据 ----------
+    @staticmethod
+    def _solid(color, fallback=''):
+        """把主题色转成不透明色（v6.66 fix）
+
+        主题里的弹层面板色是**半透明的（alpha 0.5）**—— 当右侧信息栏用这种底色时，
+        后面的聊天文字会透出来，看起来“标题串了内容”。侧栏要看得清，就得用实底。
+
+        注意：不写任何颜色字面量（主题 token 只减不增的护栏会抦）；换算失败就原样返回。
+        """
+        try:
+            s = str(color or '').strip()
+            if s.startswith('#') and len(s) in (7, 9):
+                return s[:7]
+            if s.lower().startswith('rgba'):
+                nums = [x.strip() for x in s[s.index('(') + 1:s.rindex(')')].split(',')]
+                r, g, b = (int(float(nums[i])) for i in range(3))
+                return '#' + ''.join('%02x' % v for v in (r, g, b))
+            return s
+        except Exception:
+            return fallback or str(color or '')
+
+    def _read_side_cfg(self):
+        """读信息栏配置（页签列表 + 折叠状态），不依赖任何加载顺序"""
+        try:
+            with open(CONFIG_PATH, encoding='utf-8') as f:
+                cfg = json.load(f) or {}
+            return {'tabs': cfg.get('side_panel_tabs'),
+                    'collapsed': bool(cfg.get('side_panel_collapsed', False))}
+        except Exception:
+            return {'tabs': None, 'collapsed': False}
+
+    def _save_side_panel(self, tabs, collapsed):
+        """保存页签（打字时会频繁触发 → 800ms 防抖后再写盘）"""
+        self._side_pending = {'tabs': [dict(t) for t in (tabs or [])],
+                              'collapsed': bool(collapsed)}
+        try:
+            if getattr(self, '_side_save_timer', None) is None:
+                self._side_save_timer = QTimer(self)
+                self._side_save_timer.setSingleShot(True)
+                self._side_save_timer.setInterval(800)
+                self._side_save_timer.timeout.connect(self._flush_side_panel)
+            self._side_save_timer.start()
+        except Exception as _exc:
+            _silent_log('_save_side_panel', _exc)
+
+    def _flush_side_panel(self):
+        try:
+            data = dict(getattr(self, '_side_pending', {}) or {})
+            if 'tabs' in data:
+                self._save_cfg_value('side_panel_tabs', data['tabs'])
+            if 'collapsed' in data:
+                self._save_cfg_value('side_panel_collapsed', data['collapsed'])
+        except Exception as _exc:
+            _silent_log('_flush_side_panel', _exc)
+
+    @staticmethod
+    def _fmt_num(n):
+        try:
+            n = float(n or 0)
+        except Exception:
+            return '0'
+        if n >= 1e8:
+            return '%.1f亿' % (n / 1e8)
+        if n >= 1e4:
+            return '%.1f万' % (n / 1e4)
+        return '%d' % int(n)
+
+    def _side_panel_data(self):
+        """给信息栏的动态数据（状态 / 花费 / 待办 / 系统页共用）"""
+        d = {}
+        try:
+            st = self.api_stats
+            with st.lock:
+                today = dict(st.today)
+                total = dict(st.total)
+                last = dict(st.last or {})
+            d['today_count'] = today.get('count', 0)
+            d['today_tokens'] = self._fmt_num(today.get('total', 0))
+            d['today_cost'] = '%.4f' % float(today.get('cost', 0) or 0)
+            d['total_count'] = total.get('count', 0)
+            d['total_cost'] = '%.4f' % float(total.get('cost', 0) or 0)
+            d['unknown'] = int(today.get('unknown', 0) or 0)
+            d['balance'] = st.balance_text(False) or '未查询'
+            if last:
+                d['last'] = '%s ¥%.4f' % (str(last.get('model', '?'))[:16], float(last.get('cost', 0) or 0))
+            d['hint'] = ('有 %d 次调用没配价格，已不计入 —— 可在设置 → 模型 → 🎯 模型管理 里填'
+                         % d['unknown']) if d['unknown'] else ''
+            try:
+                import server_clock as _sc
+                bj = _sc.beijing_now()
+                d['peak'] = ('%s（北京 %s）' % ('高峰' if st.is_peak_now(bj) else '空闲',
+                                              bj.strftime('%m-%d %H:%M')))
+            except Exception:
+                d['peak'] = '—'
+        except Exception:
+            pass
+        try:
+            d['model'] = self._current_model()
+        except Exception:
+            pass
+        d['voice'] = (getattr(self, 'voice_name', '') or '(默认)') + \
+                     ('' if getattr(self, 'voice_enabled', False) else '（未开朗读）')
+        try:
+            snap = self.affection.snapshot() or {}
+            lv = snap.get('level') or snap.get('affection')
+            d['affection'] = str(lv) if lv is not None else '—'
+        except Exception:
+            d['affection'] = '—'
+        try:
+            d['todos'] = [dict(t) for t in (self.todos or [])]
+        except Exception:
+            d['todos'] = []
+        try:
+            d['cpu'] = str(os.cpu_count() or '—')
+            mem = ''
+            try:
+                import ctypes
+
+                class _MS(ctypes.Structure):
+                    _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                                ('ullTotalPhys', ctypes.c_ulonglong),
+                                ('ullAvailPhys', ctypes.c_ulonglong),
+                                ('ullTotalPageFile', ctypes.c_ulonglong),
+                                ('ullAvailPageFile', ctypes.c_ulonglong),
+                                ('ullTotalVirtual', ctypes.c_ulonglong),
+                                ('ullAvailVirtual', ctypes.c_ulonglong),
+                                ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+                ms = _MS()
+                ms.dwLength = ctypes.sizeof(_MS)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                used = (ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0
+                mem = '%.1f / %.1f GB（%d%%）' % (used, ms.ullTotalPhys / 1073741824.0,
+                                                int(ms.dwMemoryLoad))
+            except Exception:
+                mem = '—'
+            d['mem'] = mem or '—'
+            up = max(0, int(time.time() - getattr(self, '_side_start_ts', time.time())))
+            d['uptime'] = '%d 小时 %d 分' % (up // 3600, (up % 3600) // 60)
+            d['version'] = 'Python %s' % __import__('platform').python_version()
+        except Exception:
+            pass
+        # v6.89：记账页签（本月花了多少 / 预算还剩多少 / 最多花在哪）
+        try:
+            ctrl = getattr(self, '_ledger', None)
+            if ctrl is not None:
+                b = ctrl.brief()
+                d['lg_month'] = b.get('label', '')
+                d['lg_expense'] = b.get('expense', '0')
+                d['lg_income'] = b.get('income', '0')
+                d['lg_balance'] = b.get('balance_text') or b.get('balance', '0')
+                d['lg_count'] = b.get('count', 0)
+                d['lg_top'] = b.get('top', '—')
+                d['lg_top_pct'] = b.get('top_pct', 0)
+                d['lg_budget_left'] = b.get('budget_left', '')
+                d['lg_over'] = b.get('over', '')
+                d['lg_over_n'] = b.get('over_n', 0)
+                d['lg_over_amount'] = b.get('over_amount', '')
+                d['lg_avg'] = b.get('avg', '0')
+            else:
+                d['lg_count'] = 0                     # 没打开过记账：页签显示「还没记账」
+        except Exception:
+            d['lg_count'] = 0
+        return d
+
+    def _toggle_task_sidebar(self):
+        """v6.43b / v6.65：收缩/展开右侧信息栏（状态记进配置）"""
+        try:
+            self.side_panel.set_collapsed(not self.side_panel.collapsed)
+            if hasattr(self, '_sync_window_to_panel'):
+                self._sync_window_to_panel()
+        except Exception:
+            pass
+
+    def _cancel_queued_task(self, item):
+        """v6.43b：双击排队任务取消（执行中任务用 /stop）"""
+        try:
+            t = item.data(Qt.UserRole)
+            if t in self._task_queue:
+                self._task_queue.remove(t)
+                self._refresh_task_sidebar()
+        except Exception:
+            pass
+
+    def _on_task_reorder(self, parent, start, end, destination, row):
+        """v6.43b：拖拽后按新顺序重建队列（跳过执行中行）"""
+        try:
+            new_q = []
+            for r in range(self.task_list.count()):
+                t = self.task_list.item(r).data(Qt.UserRole)
+                if isinstance(t, dict) and t in self._task_queue:
+                    new_q.append(t)
+            if new_q:
+                self._task_queue = new_q
+        except Exception:
+            pass
+
+    def _stop_ai(self):
+        """v6.43：强制停止当前 AI 任务（突发卡死/工具失控时用）。
+        代次 +1 使旧线程失效 → 清理状态 → 闭合悬空任务防复活"""
+        try:
+            self._ai_generation = getattr(self, '_ai_generation', 0) + 1
+            self._ai_busy = False
+            try:
+                self._remove_status_line()
+            except Exception as _exc:
+                _silent_log('_stop_ai:872', _exc)   # v6.54
+            self._close_pending_user_msg()
+            self._save_chat_memory()
+            # v6.43b：紧急停止只停当前任务，队列继续（先来先到）
+            # v6.53：不抢跑 —— 旧线程可能还在读流/吐字，等它退出后由 _ai_worker 收尾接续队列；
+            #        否则新旧两股输出会交错（就是用户看到的“放飞 / 打转”）
+            th = getattr(self, '_ai_thread', None)
+            if th is not None and th.is_alive():
+                self._pending_resume = True
+            else:
+                self._next_task()
+        except Exception as _exc:
+            _silent_log('_stop_ai:884', _exc)   # v6.54
+
+    def _close_pending_user_msg(self):
+        """v6.43：若历史最后一条是悬空 user（AI 未回复=任务中断），补一条中断说明。
+        防止下次对话 AI 把旧任务当待办继续执行"""
+        try:
+            msgs = self.chat_history_msgs
+            if msgs and msgs[-1].get('role') == 'user':
+                msgs.append({'role': 'assistant', 'content': '（上轮任务已中断取消，如需继续请重新说明）'})
+        except Exception as _exc:
+            _silent_log('_close_pending_user_msg:894', _exc)   # v6.54
+
+    def ask_ai(self, text, images=None):
+        """调用 DeepSeek API 对话（线程执行，不卡 UI）
+
+        images：v6.62 新增，本地图片路径列表 → 直接送模型看图（不再先 OCR 成文字）
+        """
+        self._load_ai_config()  # 热加载：每次聊天前刷新 config.json（改配置无需重启）
+        if not self.ai_enabled:
+            self._append_chat('桌宠', '还没配置 AI 呢！在 config.json 里加 deepseek_api_key 就能和我聊天了')
+            return
+        if getattr(self, '_ai_busy', False):
+            # v6.43b：忙碌 → 加入 FCFS 任务队列（先来先到；侧栏可拖拽调优先级、双击取消排队）
+            self._enqueue_task(text, images)
+            self._notify(
+                              f'📋 已加入任务队列（第 {len(self._task_queue)} 位，当前完成后自动执行；/stop 紧急停止当前）')
+            return
+        # v6.43b：流式重置 + 启动任务（_run_task 内分配代次/置 busy/起线程）
+        # v6.40 fix：新对话重置流式状态（工具调用轮次由续用逻辑接管，避免正文渲染进孤儿气泡）
+        self._chat_type_bubble = None
+        self._thinking_label = None
+        self._thinking_toggle = None
+        self._stream_label = None
+        self._stream_active = False
+        self._stream_text = ''
+        self._stream_pending = ''
+        self._thinking_pending = ''
+        self._stream_rendered = False
+        self._run_task(text, images)
+
+    def _vision_ready(self):
+        """v6.62：图片能不能直送模型 —— 当前档案支持看图 + 开关打开 + 有 key"""
+        try:
+            return bool(getattr(self, 'vision_enabled', False)) and bool(self._current_api_key())
+        except Exception:
+            return False
+
+    def _vision_content(self, text, images):
+        """v6.62：把图片编进 user 消息。返回 (content, 成功张数, 错误列表)
+
+        成功张数为 0 时调用方应回退本地 OCR（不让用户白等一场）。
+        开了「图片走文件接口复用」时优先用 Files API（同一张图只上传一次）。
+        """
+        paths = [p for p in (images or []) if p and os.path.isfile(str(p))]
+        if not paths:
+            return text, 0, []
+        if getattr(self, 'vision_files_api', False):
+            try:
+                content, used, errs = build_content_via_files(
+                    text, paths, self._current_api_key(), self._current_endpoint(),
+                    getattr(self, '_files_cache', None))
+                if used:
+                    return content, used, errs
+            except Exception as _exc:
+                _silent_log('_vision_content:files_api', _exc)
+        return build_vision_content(text, paths)
+
+    # ---------- 智能本地应用检索（v6.36） ----------
+    COMMON_ALIASES = {
+        '微信': 'wechat', 'weixin': 'wechat', 'vx': 'wechat',
+        'qq': 'qq', '扣扣': 'qq', '企鹅': 'qq',
+        '浏览器': 'edge', '谷歌': 'chrome', '谷歌浏览器': 'chrome', 'chrome': 'chrome',
+        '火狐': 'firefox', 'b站': 'bilibili', '哔哩哔哩': 'bilibili',
+        'word': 'word', 'excel': 'excel', 'ppt': 'powerpoint', 'wps': 'wps',
+        'ps': 'photoshop', 'photoshop': 'photoshop', 'blender': 'blender',
+        'steam': 'steam', '网易云': 'cloudmusic', '音乐': 'cloudmusic', '酷狗': 'kugou',
+        'vscode': 'code', '代码编辑器': 'code', 'pycharm': 'pycharm',
+        'python': 'python', '计算器': 'calculator', 'calc': 'calculator',
+        '记事本': 'notepad', '终端': 'terminal', '命令行': 'terminal',
+        '任务管理器': 'taskmgr', '控制面板': 'control', '设置': 'settings',
+        '资源管理器': 'explorer', '文件管理器': 'explorer', '我的电脑': 'explorer',
+        '画图': 'paint', '远程桌面': 'mstsc', '截图': 'snipping',
+        'matlab': 'matlab', 'unity': 'unity', 'godot': 'godot',
+        'geosim': 'geosim', '桌宠': 'desktop_pet', '夸克': 'quark', '百度网盘': 'baidunetdisk',
+        '联想浏览器': 'lenovo', '腾讯会议': 'wemeet', '钉钉': 'dingtalk', '企业微信': 'wecom',
+    }
+
+    def _build_app_index(self):
+        """扫描本地应用索引：开始菜单快捷方式 + 注册表已安装应用"""
+        import subprocess as _sp
+        apps = []  # [{name, path, exe}]
+        # 1. 开始菜单 .lnk（一个 PowerShell 进程批量解析）
+        ps_code = (
+            '$ws = New-Object -ComObject WScript.Shell; '
+            '$paths = @("$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs", '
+            '"$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs"); '
+            'foreach ($p in $paths) { if (Test-Path $p) { Get-ChildItem $p -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | '
+            'ForEach-Object { $sc = $ws.CreateShortcut($_.FullName); '
+            'Write-Output ($_.BaseName + "`t" + $sc.TargetPath) } } }'
+        )
+        try:
+            r = _sp.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps_code],
+                        capture_output=True, timeout=40)
+            for line in r.stdout.decode('utf-8', errors='ignore').splitlines():
+                if '\t' not in line and chr(9) not in line:
+                    continue
+                parts = line.split(chr(9))
+                if len(parts) >= 2 and parts[1].strip():
+                    apps.append({'name': parts[0].strip(), 'path': parts[1].strip(),
+                                 'exe': os.path.basename(parts[1].strip()).lower()})
+        except Exception as _exc:
+            _silent_log('_build_app_index:965', _exc)   # v6.54
+        # 2. 注册表已安装应用
+        try:
+            import winreg
+            seen = set()
+            for hive, subkey in [
+                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
+                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'),
+                (winreg.HKEY_CURRENT_USER, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
+            ]:
+                try:
+                    key = winreg.OpenKey(hive, subkey)
+                    for i in range(winreg.QueryInfoKey(key)[0]):
+                        try:
+                            sk = winreg.EnumKey(key, i)
+                            skh = winreg.OpenKey(key, sk)
+                            try:
+                                name, _ = winreg.QueryValueEx(skh, 'DisplayName')
+                                icon, _ = winreg.QueryValueEx(skh, 'DisplayIcon')
+                            except Exception as _exc:
+                                _silent_log('_build_app_index:985', _exc)   # v6.54
+                                continue
+                            exe = ''
+                            if icon:
+                                exe = os.path.basename(icon.split(',')[0]).lower()
+                            if name and (name, exe) not in seen:
+                                seen.add((name, exe))
+                                apps.append({'name': str(name).strip(), 'path': icon.split(',')[0] if icon else '',
+                                             'exe': exe})
+                        except Exception as _exc:
+                            _silent_log('_build_app_index:994', _exc)   # v6.54
+                            continue
+                except Exception as _exc:
+                    _silent_log('_build_app_index:996', _exc)   # v6.54
+                    continue
+        except Exception as _exc:
+            _silent_log('_build_app_index:998', _exc)   # v6.54
+        return apps
+
+    def _load_app_index(self):
+        """加载/构建应用索引（缓存 24h）"""
+        idx_path = os.path.join(BASE_DIR, 'app_index.json')
+        try:
+            if os.path.exists(idx_path):
+                with open(idx_path, encoding='utf-8') as f:
+                    data = json.load(f)
+                if time.time() - data.get('built_at', 0) < 86400:
+                    return data.get('apps', [])
+        except Exception as _exc:
+            _silent_log('_load_app_index:1011', _exc)   # v6.54
+        apps = self._build_app_index()
+        try:
+            self._atomic_write_json(idx_path, {'built_at': time.time(), 'apps': apps}, pretty=False)
+        except Exception as _exc:
+            _silent_log('_load_app_index:1016', _exc)   # v6.54
+        return apps
+
+    def _smart_find_app(self, query):
+        """智能匹配本地应用：别名→精确→子串→拼音首字母→模糊，返回 (path, name) 或 None"""
+        import difflib
+        q = query.strip().lower().replace('.exe', '').replace('打开', '').replace('启动', '').replace('运行', '').strip()
+        if not q:
+            return None
+        apps = self._load_app_index()
+        if not apps:
+            return None
+
+        # 系统自带应用直映射（无快捷方式，直接给 system32 路径）
+        sysapps = {
+            'notepad': (r'C:\Windows\System32\notepad.exe', '记事本'),
+            'calc': (r'C:\Windows\System32\calc.exe', '计算器'),
+            'calculator': (r'C:\Windows\System32\calc.exe', '计算器'),
+            'paint': (r'C:\Windows\System32\mspaint.exe', '画图'),
+            'taskmgr': (r'C:\Windows\System32\Taskmgr.exe', '任务管理器'),
+            'control': (r'C:\Windows\System32\control.exe', '控制面板'),
+            'mstsc': (r'C:\Windows\System32\mstsc.exe', '远程桌面'),
+            'explorer': (r'C:\Windows\explorer.exe', '资源管理器'),
+        }
+        for at in self.COMMON_ALIASES.values():
+            pass
+        if q in self.COMMON_ALIASES and self.COMMON_ALIASES[q] in sysapps:
+            p2, n2 = sysapps[self.COMMON_ALIASES[q]]
+            if os.path.exists(p2):
+                return (p2, n2)
+        if q in sysapps:
+            p2, n2 = sysapps[q]
+            if os.path.exists(p2):
+                return (p2, n2)
+
+        # 别名展开（如 微信→wechat, 浏览器→edge）
+        alias_targets = []
+        if q in self.COMMON_ALIASES:
+            alias_targets.append(self.COMMON_ALIASES[q])
+        # 拼音首字母（wx→微信, qq→QQ, wps）
+        pinyin_letters = ''.join([c for c in q if c.isascii() and c.isalpha()]).lower()
+
+        def score(app):
+            name = (app.get('name') or '').lower()
+            exe = app.get('exe') or ''
+            p = (app.get('path') or '').lower()
+            # 别名目标精确命中 exe（最强证据）
+            for at in alias_targets:
+                if at == exe or at + '.exe' == exe:
+                    return 100
+            # 名称/路径精确
+            if q == name or q == exe or q == name.replace(' ', ''):
+                return 100
+            # 别名出现在 exe/路径
+            for at in alias_targets:
+                if at in exe or at in p:
+                    return 95
+            # 别名出现在名称
+            for at in alias_targets:
+                if at in name:
+                    return 85
+            if q in exe:
+                return 80
+            if q in name or name in q:
+                return 65
+            if pinyin_letters and len(pinyin_letters) >= 2:
+                if pinyin_letters == ''.join([c for c in name if c.isascii()]).lower()[:len(pinyin_letters)]:
+                    return 75
+            return 0
+
+        scored = [(score(a), a) for a in apps]
+        scored.sort(key=lambda x: -x[0])
+        best_score, best = scored[0] if scored else (0, None)
+        if best_score >= 75:
+            return (best.get('path') or best.get('name'), best.get('name'))
+        # 模糊匹配兜底（difflib）
+        names = [a.get('name', '') for a in apps]
+        close = difflib.get_close_matches(q, [n.lower() for n in names], n=1, cutoff=0.5)
+        if close:
+            for a in apps:
+                if (a.get('name') or '').lower() == close[0]:
+                    return (a.get('path') or a.get('name'), a.get('name'))
+        return None
+
+    def _load_aliases(self):
+        """从 config.json 加载自定义应用快捷指令别名表"""
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            aliases = cfg.get('app_aliases', {})
+            return {str(k).strip().lower(): str(v).strip() for k, v in aliases.items() if str(v).strip()}
+        except Exception:
+            return {}
+
+    def _smart_open(self, app):
+        """智能打开：别名表 → 映射表 → 系统命令 → 开始菜单 → 网址 → 文件路径"""
+        import subprocess
+        app = app.strip()
+        if not app:
+            return '没有指定要打开的内容'
+
+        # 0.5 智能本地应用检索（v6.36）：先找电脑上装没装，再谈浏览器
+        found = self._smart_find_app(app)
+        if found:
+            target, display = found
+            try:
+                target = (target or '').strip()
+                if target and target.lower().endswith(('.exe', '.lnk', '.bat', '.cmd')):
+                    pl.open_path(target)
+                elif target and os.path.isdir(target):
+                    pl.open_path(target)
+                elif target and os.path.exists(target):
+                    # 非可执行文件（如 .ico/.url）：同目录找 exe 兜底
+                    import glob as _glob
+                    exe_found = None
+                    for pat in ('*.exe', '*.lnk'):
+                        cands = _glob.glob(os.path.join(os.path.dirname(target), pat))
+                        if cands:
+                            exe_found = cands[0]
+                            break
+                    if exe_found:
+                        pl.open_path(exe_found)
+                    else:
+                        pl.open_path(display)
+                else:
+                    # 只有名字没有路径（如 UWP）：尝试 start
+                    pl.open_path(display)
+                return f'已打开 {display}'
+            except Exception as e:
+                return f'打开 {display} 失败：{e}'
+
+        # 0. 用户自定义别名表（config.json 的 app_aliases，优先级最高）
+        alias_key = app.lower().strip()
+        if alias_key in self.app_aliases:
+            target = self.app_aliases[alias_key]
+            try:
+                if os.path.isdir(target):
+                    pl.open_path(target)
+                elif os.path.exists(target):
+                    pl.open_path(target)
+                else:
+                    pl.open_path(target)
+                return f'已打开 {app}（{target}）'
+            except Exception as e:
+                return f'打开 {app} 失败：{e}'
+
+        # 1. 已知应用映射表
+        appmap = {
+            '记事本': 'notepad.exe', '计算器': 'calc.exe', '画图': 'mspaint.exe',
+            'cmd': 'cmd.exe', '命令提示符': 'cmd.exe', 'powershell': 'powershell.exe',
+            '任务管理器': 'taskmgr.exe', '控制面板': 'control.exe',
+            '资源管理器': 'explorer.exe', '文件管理器': 'explorer.exe',
+            'word': 'winword.exe', 'excel': 'excel.exe', 'ppt': 'powerpnt.exe',
+            'outlook': 'outlook.exe', 'edge': 'msedge.exe',
+            '浏览器': None,  # 特殊处理
+        }
+        key = app.lower()
+        if key in appmap:
+            target = appmap[key]
+            if target is None:  # 浏览器 → 打开主页
+                pl.open_url('http://www.baidu.com')
+                return f'已打开浏览器'
+            try:
+                subprocess.Popen([target])
+                return f'已打开 {app}'
+            except Exception as _exc:
+                _silent_log('_smart_open:1182', _exc)   # v6.54
+
+        # 2. 常见中文名映射（非精确匹配）
+        fuzzy = {
+            'pycharm': 'pycharm', 'vscode': 'code', 'vs code': 'code',
+            '微信': 'wechat', 'qq': 'qq', '哔哩哔哩': 'bilibili',
+            'b站': 'bilibili', 'bilibili': 'bilibili', 'steam': 'steam',
+            '网易云': 'cloudmusic', '音乐': 'cloudmusic', 'potplayer': 'potplayer',
+        }
+        if key in fuzzy:
+            target = fuzzy[key]
+            # 网站类应用：直接浏览器打开，不尝试 start（避免错误弹窗）
+            site_map = {'bilibili': 'https://www.bilibili.com', 'wechat': 'https://weixin.qq.com'}
+            if target in site_map:
+                pl.open_url(site_map[target])
+                return f'已用浏览器打开 {app}'
+            # 桌面应用：尝试 start（查找 PATH / 关联）
+            result = 1 if pl.open_path(target) else 0
+            if result == 0:
+                return f'已尝试打开 {app}'
+            # 失败则用浏览器兜底
+            pl.open_search(app)
+            return f'已尝试打开 {app}，若失败已用浏览器搜索'
+
+        # 3. 检查是否含网址关键词 → 浏览器打开
+        url_keywords = ['http', 'www.', '.com', '.cn', '.net', '.org', 'bilibili', '知乎', '百度']
+        if any(k in app.lower() for k in url_keywords) or app in ('bilibili', '哔哩哔哩', 'b站'):
+            url = app
+            if not app.startswith('http'):
+                url = f'https://www.{app}.com' if '.' not in app else f'https://{app}'
+            pl.open_url(url)
+            return f'已用浏览器打开 {app}'
+
+        # 4. 尝试 where 查找命令
+        try:
+            where_result = subprocess.run(['where', app], capture_output=True, text=True, timeout=5)
+            if where_result.returncode == 0:
+                path = where_result.stdout.strip().split('\n')[0]
+                subprocess.Popen([path])
+                return f'已打开 {app}'
+        except Exception as _exc:
+            _silent_log('_smart_open:1223', _exc)   # v6.54
+
+        # 5. 尝试文件路径（存在则用默认程序打开）
+        if os.path.exists(app):
+            pl.open_path(app)
+            return f'已打开 {app}'
+
+        # 6. 尝试开始菜单搜索（shell:AppsFolder 或直接 start 尝试）
+        try:
+            result = pl.open_path(app)
+            if result == 0:
+                return f'已尝试打开 {app}'
+        except Exception as _exc:
+            _silent_log('_smart_open:1236', _exc)   # v6.54
+
+        return f'找不到 {app}，请确认名称'
+
+    # ============ 长期记忆系统（v6.11） ============
+    def _load_memory(self):
+        """加载 memory.json（事实 + 摘要；数据层拆至 memory_store）"""
+        self.memory_facts, self.memory_summaries = load_memory(MEMORY_PATH)
+
+    def _save_memory(self):
+        """保存 memory.json（数据层拆至 memory_store）"""
+        save_memory(MEMORY_PATH, self.memory_facts, self.memory_summaries)
+
+    # ---------- v6.41 记忆引擎：检索重排 + 自动抽取（memory_engine） ----------
+    @staticmethod
+    def _parse_rerank_ids(raw):
+        """解析重排结果（v6.62）：优先 JSON（官方 json_object），失败再抠数字。
+
+        返回整数列表（可能为空，由调用方决定兼底）。
+        """
+        import re as _re
+        text = str(raw or '')
+
+        def _seq_from(obj):
+            if isinstance(obj, dict):
+                seq = obj.get('ids')
+                if seq is None:
+                    seq = obj.get('id')
+            else:
+                seq = obj
+            if isinstance(seq, (int, float, str)):
+                seq = [seq]
+            if not isinstance(seq, (list, tuple)):
+                return []
+            out = []
+            for n in seq:
+                try:
+                    out.append(int(str(n).strip()))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        try:
+            got = _seq_from(json.loads(text))
+            if got:
+                return got
+        except Exception:
+            pass
+        try:
+            m = _re.search(r'\{.*\}', text, _re.S)
+            if m:
+                got = _seq_from(json.loads(m.group(0)))
+                if got:
+                    return got
+        except Exception:
+            pass
+        return [int(n) for n in _re.findall(r'\d+', text)]
+
+    def _rerank_memories(self, query, candidates):
+        """LLM 重排：候选记忆 → 选最相关 top-3（8 选 3 把关，复用 deepseek_client）"""
+        try:
+            lines = '\n'.join(f'{i + 1}. {c.get("text", "")}' for i, c in enumerate(candidates))
+            prompt = (f'用户问：{query}\n候选记忆：\n{lines}\n'
+                      f'请选出与问题最相关的 1-3 条（宁缺毋滥，不相关的不选），'
+                      f'只输出 JSON（不要其它文字）：{{"ids": [编号, ...]}}，按相关度从高到低。')
+            data = json.dumps({'model': self._current_model(),
+                               'messages': [{'role': 'user', 'content': prompt}],
+                               'max_tokens': 60,
+                               # v6.62：官方结构化输出（提示词里已含“JSON”字样）
+                               'response_format': {'type': 'json_object'}}).encode()
+            resp = chat_completions(self._current_api_key(), data)
+            self._record_api_usage(resp)
+            nums = self._parse_rerank_ids(resp['choices'][0]['message'].get('content') or '')
+            picked = [candidates[i - 1]['id'] for i in nums if 1 <= i <= len(candidates)]
+            return picked or [c['id'] for c in candidates[:3]]
+        except Exception:
+            return [c['id'] for c in candidates[:3]]
+
+    def _maybe_extract_memory(self):
+        """低频触发自动抽取：距上次 ≥30 分钟且对话 ≥4 轮"""
+        try:
+            now = time.time()
+            last = getattr(self, '_last_extract_ts', 0)
+            if now - last < 1800:
+                return
+            if len(self.chat_history_msgs) < 4:
+                return
+            self._last_extract_ts = now
+            import threading as _th
+            _th.Thread(target=self._extract_worker, daemon=True).start()
+        except Exception as _exc:
+            _silent_log('_maybe_extract_memory:1282', _exc)   # v6.54
+
+    def _extract_chat(self, messages, max_tokens):
+        """抽取用的 LLM 调用（worker 线程，非流式）"""
+        try:
+            data = json.dumps({'model': self._current_model(),
+                               'messages': messages, 'max_tokens': max_tokens,
+                               # v6.62：官方结构化输出 —— 抽取提示词里已含“JSON”字样，
+                               # 让模型直接吐合法 JSON，不再靠正则抠（抠失败就静默丢记忆）
+                               'response_format': {'type': 'json_object'}}).encode()
+            resp = chat_completions(self._current_api_key(), data)
+            self._record_api_usage(resp)
+            return resp['choices'][0]['message'].get('content') or ''
+        except Exception:
+            return ''
+
+    def _extract_worker(self):
+        """抽取线程：最近对话 → LLM 提炼事实/事件 → 写回 memory.json / memories.json"""
+        try:
+            recent = list(self.chat_history_msgs[-8:])
+            dialogue = '\n'.join(
+                f'{"用户" if m.get("role") == "user" else "桌宠"}: {str(m.get("content", ""))[:150]}'
+                for m in recent if m.get('content'))
+            existing = '；'.join(str(f.get('content', ''))[:60] for f in self.memory_facts[-10:]
+                                 if f.get('status', 'active') == 'active')
+            result = extract_memories(self._extract_chat, dialogue, existing)
+            changed = False
+            for f in result.get('facts', []):
+                content = str(f.get('content', '')).strip()
+                if content:
+                    self.memory_facts, _msg = remember_fact(
+                        self.memory_facts, 'add', content, f.get('importance', 3), role='both')
+                    changed = True
+            for u in result.get('update_facts', []):
+                fid = str(u.get('id', ''))
+                content = str(u.get('content', '')).strip()
+                if fid and content:
+                    self.memory_facts, _msg = remember_fact(
+                        self.memory_facts, 'update', content, fid=fid, role='both')
+                    changed = True
+            if changed:
+                self._save_memory()
+            for e in result.get('events', []):
+                title = str(e.get('title', '')).strip()
+                if title:
+                    try:
+                        self.memories.add(self.current, 'event', title,
+                                          str(e.get('detail', ''))[:200])
+                    except Exception as _exc:
+                        _silent_log('_extract_worker:1328', _exc)   # v6.54
+        except Exception as _exc:
+            _silent_log('_extract_worker:1330', _exc)   # v6.54
+
+    def _remember_fact(self, action, content='', importance=3, fid='', role='both'):
+        """memorize 工具处理（数据逻辑拆至 memory_store.remember_fact，此处持有状态+落盘）"""
+        self.memory_facts, msg = remember_fact(
+            self.memory_facts, action, content, importance, fid, role)
+        self._save_memory()
+        return msg
+
+    def _memory_block(self):
+        """生成注入 system prompt 的记忆块（拆至 prompt_builder.build_memory_block）"""
+        return build_memory_block(self.memory_facts, self.memory_summaries, self.current)
+
+    def _summarize_old(self):
+        """旧消息滚动摘要：chat_history_msgs 超 20 条时，最旧 10 条压成摘要"""
+        if len(self.chat_history_msgs) <= 20 or not self.ai_enabled:
+            return
+        try:
+            old = self.chat_history_msgs[:10]
+            texts = []
+            for m in old:
+                c = (m.get('content') or '').strip()
+                if c and not c.startswith('（'):
+                    texts.append(f'{"用户" if m.get("role") == "user" else "桌宠"}: {c[:100]}')
+            if not texts:
+                self.chat_history_msgs = self.chat_history_msgs[10:]
+                return
+            # 复用抽取用的 LLM 调用：模型与接口地址均取自模型档案。
+            # 原实现裸写 URL 并引用了本作用域不存在的 cur_model，抛出的 NameError
+            # 被下方 except 吞掉 → 摘要从不生成、最旧 10 条从不裁剪。
+            summary = (self._extract_chat(
+                [{'role': 'user',
+                  'content': f'把下面的对话压缩成 1-2 句中文摘要（≤120字），只留关键信息：\n' + '\n'.join(texts[-8:])}],
+                200) or '').strip()
+            if summary:
+                self.memory_summaries.append({'content': summary, 'time': __import__('datetime').datetime.now().isoformat(timespec='seconds')})
+                if len(self.memory_summaries) > 6:
+                    self.memory_summaries = self.memory_summaries[-6:]
+                self._save_memory()
+            self.chat_history_msgs = self.chat_history_msgs[10:]
+        except Exception:
+            pass
+
+    # ---------- v6.91：权限档位（放不放权） ----------
+    def _perm_hint(self, level=None):
+        """按钮 tooltip：一眼看清现在哪档、这档会问什么、管多久"""
+        level = level or self.perm.level
+        return '%s %s\n%s\n%s' % (perm.ICON.get(level, ''),
+                                  self._t(perm.LABEL_KEY[level]),
+                                  self._t(perm.HINT_KEY[level]),
+                                  self._t('perm_scope'))
+
+    def _apply_perm_btn(self):
+        """按钮跟着档位变：图标 + 颜色 + 提示（颜色让"全放权"一直看得见）"""
+        try:
+            self.perm_btn.setText(self.perm.icon())
+            self.perm_btn.setToolTip(self._perm_hint())
+            f = getattr(self.perm_btn, '_theme_qss', None)   # 主题工厂里读的是当前档位
+            if f:
+                self.perm_btn.setStyleSheet(f())
+        except Exception as _exc:
+            _silent_log('_apply_perm_btn', _exc)
+
+    def _set_perm(self, level):
+        """切档：记审计 + 更新按钮 + 顶部说一句（放权不许悄悄生效）"""
+        old = self.perm.level
+        if not self.perm.set(level):
+            return False
+        perm.note_switch(level, old)
+        self._apply_perm_btn()
+        hint = self._t(perm.HINT_KEY[level])
+        self._notify('%s %s' % (perm.ICON.get(level, ''), hint), ms=self.COST_NOTIFY_MS)
+        return True
+
+    def _perm_build_menu(self):
+        """建三档菜单（拆出来是为了能截图验证：`exec()` 阻塞，`popup()` 才能抓图）"""
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        head = menu.addAction(self._t('perm_menu'))
+        head.setEnabled(False)
+        menu.addSeparator()
+        for lv in perm.LEVELS:
+            act = menu.addAction('%s  %s' % (perm.ICON[lv], self._t(perm.LABEL_KEY[lv])))
+            act.setCheckable(True)
+            act.setChecked(self.perm.level == lv)
+            act.setToolTip(self._t(perm.HINT_KEY[lv]))
+            act.triggered.connect(lambda _checked=False, _lv=lv: self._set_perm(_lv))
+        menu.addSeparator()
+        scope = menu.addAction('· ' + self._t('perm_scope'))
+        scope.setEnabled(False)
+        return menu
+
+    def _perm_menu(self):
+        """点一下锁：弹出三档菜单（当前档打勾），底下写清"只管本轮对话" """
+        try:
+            self._perm_build_menu().exec(
+                self.perm_btn.mapToGlobal(self.perm_btn.rect().bottomLeft()))
+        except Exception as _exc:
+            _silent_log('_perm_menu', _exc)
+
+    def _request_confirm(self, message):
+        """跨线程请求用户确认（主线程弹窗），返回 True/False"""
+        import threading
+        evt = threading.Event()
+        result = {'ok': False}
+        def ask():
+            try:
+                from PySide6.QtWidgets import QMessageBox
+                is_en = getattr(self, 'language', 'zh') == 'en'
+                box = QMessageBox(self)
+                box.setWindowTitle(self._t('dlg_confirm'))
+                box.setIcon(QMessageBox.Warning)
+                box.setText(message)
+                box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                box.setDefaultButton(QMessageBox.No)
+                box.button(QMessageBox.Yes).setText(self._t('allow'))
+                box.button(QMessageBox.No).setText(self._t('deny'))
+                result['ok'] = (box.exec() == QMessageBox.Yes)
+            except Exception:
+                result['ok'] = False
+            evt.set()
+        self.confirm_signal.emit(ask)
+        evt.wait(timeout=120)
+        return result['ok']
+
+    # ============ 记忆管理 UI（v6.12） ============
+    def _show_memory(self):
+        """查看长期记忆（显示到聊天面板）"""
+        active = [f for f in self.memory_facts if f.get('status') == 'active']
+        if not active:
+            self._notify('🧠 还没有长期记忆。对话中告诉我你的偏好/重要信息，我会自动记住')
+            return
+        active.sort(key=lambda x: -x.get('importance', 3))
+        lines = [f'🧠 长期记忆（{len(active)} 条）：']
+        for f in active:
+            lines.append(f'  ★{f.get("importance", 3)} {f.get("content", "")}')
+        self._append_chat('桌宠', '\n'.join(lines))
+
+    def _delete_memory_dialog(self):
+        """弹窗选择要删除的记忆"""
+        active = [f for f in self.memory_facts if f.get('status') == 'active']
+        if not active:
+            self._notify('🧠 还没有长期记忆可删除')
+            return
+        items = [f.get('content', '')[:40] for f in active]
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getItem(self, '删除记忆', '选择要遗忘的记忆：', items, 0, False)
+        if ok and text:
+            for f in active:
+                if f.get('content', '')[:40] == text:
+                    self._remember_fact('delete', fid=f.get('id', ''))
+                    self._notify(f'🗑 已遗忘：{f.get("content", "")}')
+                    return
+
+    def _clear_memory_confirm(self):
+        """确认后清空全部记忆"""
+        active = [f for f in self.memory_facts if f.get('status') == 'active']
+        if not active:
+            self._notify('🧠 没有需要清空的记忆' if getattr(self, 'language', 'zh') != 'en' else '🧠 No memory to clear')
+            return
+        from PySide6.QtWidgets import QMessageBox
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        box = QMessageBox(self)
+        box.setWindowTitle(self._t('dlg_clear_mem'))
+        box.setIcon(QMessageBox.Warning)
+        box.setText(f'确定清空全部 {len(active)} 条长期记忆吗？\n清空后桌宠将不再记得这些信息' if not is_en else f'Clear all {len(active)} memories?\nThe pet will forget this information')
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        box.button(QMessageBox.Yes).setText('清空' if not is_en else 'Clear')
+        box.button(QMessageBox.No).setText('取消' if not is_en else 'Cancel')
+        if box.exec() == QMessageBox.Yes:
+            for f in active:
+                self._remember_fact('delete', fid=f.get('id', ''))
+            self._save_memory()
+            self._notify('🧹 长期记忆已全部清空' if not is_en else '🧹 All memories cleared')
+
+    # ============ 全局快捷键（v6.12，Ctrl+Alt+P 呼出） ============
+    def _on_global_hotkey(self):
+        """全局热键回调：唤出桌宠 + 打开聊天面板"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if not self.chat_panel.isVisible():
+            self.toggle_chat_panel()
+        self.chat_input.setFocus()
+
+    # ============ TODO 待办清单（v6.17） ============
+    def _load_todos(self):
+        """加载 todos.json"""
+        try:
+            import json as _j
+            if os.path.exists(TODO_PATH):
+                self.todos = _j.load(open(TODO_PATH, encoding='utf-8'))
+            else:
+                self.todos = []
+        except Exception:
+            self.todos = []
+
+    def _save_todos(self):
+        try:
+            self._atomic_write_json(TODO_PATH, self.todos)
+        except Exception:
+            pass
+
+    def _todo_block(self):
+        """生成注入 prompt 的待办清单块（拆至 prompt_builder.build_todo_block）"""
+        return build_todo_block(self.todos)
+
+    def _manage_todo(self, action, text='', tid=''):
+        """待办操作：add/list/done/remove"""
+        import datetime
+        now = datetime.datetime.now().strftime('%m-%d %H:%M')
+        action = (action or 'list').lower()
+        if action == 'add':
+            if not text.strip():
+                return '内容为空'
+            self.todos.append({'id': f't{int(datetime.datetime.now().timestamp() * 1000)}',
+                               'text': text.strip(), 'done': False, 'created': now})
+            self._save_todos()
+            return f'已加入待办：{text.strip()}（当前 {len(self.todos)} 项）'
+        if action == 'list':
+            if not self.todos:
+                return '当前没有待办事项'
+            return '\n'.join(f'{"✅" if t.get("done") else "⬜"} {t.get("text", "")}' for t in self.todos)
+        if action == 'done':
+            for t in self.todos:
+                if t.get('id') == tid or (text and (text in t.get('text', ''))):
+                    t['done'] = True
+                    self._save_todos()
+                    return f'已完成：{t.get("text", "")}'
+            return '未找到对应待办'
+        if action == 'remove':
+            for t in self.todos[:]:
+                if t.get('id') == tid or (text and (text in t.get('text', ''))):
+                    self.todos.remove(t)
+                    self._save_todos()
+                    return f'已删除待办：{t.get("text", "")}'
+            return '未找到对应待办'
+        return '未知操作（add/list/done/remove）'
+
+    def _open_todo_manager(self):
+        """待办管理窗口：添加/勾选完成/删除/清空已完成"""
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+                                       QPushButton, QHeaderView, QLineEdit)
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        T = self._t
+        dlg = QDialog(self)
+        dlg.setWindowTitle(T('todo_menu'))
+        pwin.add_hide_button(dlg)       # v6.90：标题栏「—」隐藏键
+        dlg.resize(540, 420)
+        lay = QVBoxLayout(dlg)
+
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels([T('todo_status'), T('mem_content'), T('todo_time')])
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.setColumnWidth(0, 70)
+        table.setColumnWidth(2, 110)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        lay.addWidget(table, 1)
+
+        def refresh():
+            table.setRowCount(0)
+            for t in self.todos:
+                r = table.rowCount()
+                table.insertRow(r)
+                table.setItem(r, 0, QTableWidgetItem('✅' if t.get('done') else '⬜'))
+                table.setItem(r, 1, QTableWidgetItem(t.get('text', '')))
+                table.setItem(r, 2, QTableWidgetItem(t.get('created', '')))
+
+        def toggle_done(row, col):
+            if row < len(self.todos):
+                self.todos[row]['done'] = not self.todos[row].get('done', False)
+                self._save_todos()
+                refresh()
+
+        def add_todo():
+            txt = inp.text().strip()
+            if txt:
+                self._manage_todo('add', txt)
+                inp.clear()
+                refresh()
+
+        def done_selected():
+            rows = sorted({i.row() for i in table.selectedIndexes()}, reverse=True)
+            for r in rows:
+                if 0 <= r < len(self.todos):
+                    self.todos[r]['done'] = True
+            self._save_todos()
+            refresh()
+
+        def del_selected():
+            rows = sorted({i.row() for i in table.selectedIndexes()}, reverse=True)
+            for r in rows:
+                if 0 <= r < len(self.todos):
+                    self.todos.pop(r)
+            self._save_todos()
+            refresh()
+
+        def clear_done():
+            self.todos = [t for t in self.todos if not t.get('done')]
+            self._save_todos()
+            refresh()
+
+        # 输入行
+        top = QHBoxLayout()
+        inp = QLineEdit()
+        inp.setPlaceholderText(T('todo_placeholder'))
+        inp.returnPressed.connect(add_todo)
+        b_add = QPushButton(T('todo_add'))
+        b_add.clicked.connect(add_todo)
+        top.addWidget(inp, 1)
+        top.addWidget(b_add)
+        lay.addLayout(top)
+
+        # 操作行
+        bottom = QHBoxLayout()
+        b_done = QPushButton(T('todo_done'))
+        b_done.clicked.connect(done_selected)
+        b_del = QPushButton(T('todo_del'))
+        b_del.clicked.connect(del_selected)
+        b_clear = QPushButton(T('todo_clear_done'))
+        b_clear.clicked.connect(clear_done)
+        b_close = QPushButton('✕')
+        b_close.clicked.connect(dlg.close)
+        bottom.addWidget(b_done)
+        bottom.addWidget(b_del)
+        bottom.addWidget(b_clear)
+        bottom.addStretch(1)
+        bottom.addWidget(b_close)
+        lay.addLayout(bottom)
+
+        table.cellDoubleClicked.connect(toggle_done)
+        refresh()
+        dlg.exec()
+
+    # ============ AI 状态预判（v6.19） ============
+    @staticmethod
+    def _guess_status(text):
+        """按用户消息关键词预判 AI 状态（拆至 prompt_builder.guess_status）"""
+        return guess_status(text)
+
+    def _web_search(self, query):
+        """Tavily 联网搜索：返回格式化结果给 LLM；未配置 key 时返回提示"""
+        if not getattr(self, 'search_api_key', ''):
+            return '（未配置搜索 API key：请在 设置 → 联网搜索 中填写 Tavily API key 后重试）'
+        try:
+            import urllib.request as _ur
+            payload = json.dumps({
+                'api_key': self.search_api_key,
+                'query': query,
+                'max_results': 5,
+                'search_depth': 'basic',
+            }).encode()
+            req = _ur.Request('https://api.tavily.com/search', data=payload,
+                              headers={'Content-Type': 'application/json'})
+            with _ur.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode())
+            results = data.get('results', [])
+            if not results:
+                return '（搜索无结果）'
+            lines = []
+            for r in results[:5]:
+                title = r.get('title', '')
+                url = r.get('url', '')
+                content = (r.get('content') or '')[:200]
+                lines.append(f'- {title} | {url}\n  {content}')
+            return '\n'.join(lines)
+        except Exception as e:
+            return f'（搜索失败：{e}）'
+
+    # ---------- AI 自我管理（阶段1+2：改配置/读自己代码） ----------
+    CONFIG_WHITELIST = ('personality', 'reply_style', 'max_tokens', 'city', 'language',
+                        'active_chat', 'dock_probe', 'balance_low_threshold', 'display_mode',
+                        'live2d_model', 'sedentary_minutes', 'api_prices')
+
+    def _search_code(self, keyword, max_results=20):
+        """薄委托（实现见 pet_selfcode.search_code，v6.51 搬出）"""
+        return search_code(keyword, max_results, base_dir=BASE_DIR)
+
+
+    def _write_config_tool(self, key, value):
+        """AI 修改白名单配置（敏感字段禁止，改完热加载）"""
+        key = (key or '').strip()
+        value = (value or '').strip()
+        if key not in self.CONFIG_WHITELIST:
+            return f'（字段 {key} 不在可修改白名单：{"/".join(self.CONFIG_WHITELIST)}）'
+        # 值类型校验
+        if key in ('max_tokens', 'sedentary_minutes'):
+            try:
+                value = str(clamp_tokens(value) if key == 'max_tokens' else max(5, min(int(value), 240)))
+            except ValueError:
+                return '（需要数字）'
+        if key == 'reply_style' and value not in ('short', 'normal', 'detailed'):
+            return '（reply_style 需为 short/normal/detailed）'
+        if key == 'language' and value not in ('zh', 'en'):
+            return '（language 需为 zh/en）'
+        if key == 'display_mode' and value not in ('static', 'live2d'):
+            return '（display_mode 需为 static/live2d）'
+        if key == 'active_chat':
+            value = 'true' if value.lower() in ('true', '1', '开', 'on', 'yes') else 'false'
+        if key == 'dock_probe':
+            value = 'true' if value.lower() in ('true', '1', '开', 'on', 'yes') else 'false'
+        if key == 'balance_low_threshold':
+            try:
+                value = str(max(0.0, min(float(value), 100000.0)))
+            except ValueError:
+                return '（需要数字，单位元）'
+        if key == 'api_prices':
+            # JSON 对象：{"模型名": {"input": x, "cache": y, "output": z}}（每百万 token 单价）
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                return '（api_prices 需要合法 JSON，如 {"deepseek-flash":{"input":1,"output":2}}）'
+            if not isinstance(parsed, dict):
+                return '（api_prices 需要 JSON 对象）'
+            for k, v in parsed.items():
+                if not isinstance(v, dict):
+                    return f'（模型 {k} 的价格需要对象，如 {{"input":1,"output":2}}）'
+            value = json.dumps(parsed, ensure_ascii=False)
+        if self._save_cfg_value(key, value):
+            # 热加载
+            try:
+                if key == 'personality':
+                    self.personality = value
+                elif key == 'reply_style':
+                    self.reply_style = value
+                elif key == 'max_tokens':
+                    self.max_tokens = int(value)
+                elif key == 'city':
+                    self.pet_city = value
+                elif key == 'language':
+                    self._run_on_ui(lambda v=value: self._set_language(v))  # v6.58 GUI 回主线程
+                elif key == 'active_chat':
+                    self.active_chat_enabled = value == 'true'
+                elif key == 'dock_probe':
+                    self.dock_probe = value == 'true'
+                elif key == 'balance_low_threshold':
+                    self.balance_low_threshold = float(value)
+                elif key == 'display_mode':
+                    self._run_on_ui(lambda v=value: self._set_display_mode(v))  # v6.58 GUI 回主线程
+                elif key == 'api_prices':
+                    # 热加载价格（空对象 = 恢复出厂价）；经 api_stats 统一处理，
+                    # 有模型档案时写进档案，避免与内置表各存一份
+                    self.api_stats.reload_prices()
+                elif key == 'live2d_model':
+                    self._set_live2d_model(value)
+                elif key == 'sedentary_minutes':
+                    self.sedentary_minutes = int(value)
+            except Exception:
+                pass
+            return f'✅ 已修改 {key}={value}'
+        return '（写入失败）'
+
+    def _write_file_tool(self, filename, content):
+        """薄委托（实现见 pet_selfcode.write_file_tool）"""
+        return write_file_tool(filename, content, base_dir=BASE_DIR)
+
+    def _edit_own_code(self, old_text, new_text, start_line=None, end_line=None,
+                      file='desktop_pet.py'):
+        """薄委托（实现见 pet_selfcode.edit_own_code）"""
+        return edit_own_code(old_text, new_text, start_line, end_line, file,
+                             base_dir=BASE_DIR)
+
+    # v6.51：工具分发改成注册表——原先 29 个 if/elif 分支串在一个 169 行的方法里，
+    # 加一个工具要读懂整条链子。现在：注册表一行 + 一个 _tool_xxx 小方法。
+    _TOOL_HANDLERS = {
+        'calculate': '_tool_calculate',
+        'control_volume': '_tool_control_volume',
+        'edit_own_code': '_tool_edit_own_code',
+        'get_system_info': '_tool_get_system_info',
+        'get_time': '_tool_get_time',
+        'install_plugin': '_tool_install_plugin',
+        'kill_process': '_tool_kill_process',
+        'list_plugins': '_tool_list_plugins',
+        'list_processes': '_tool_list_processes',
+        'lock_screen': '_tool_lock_screen',
+        'manage_todo': '_tool_manage_todo',
+        'ledger': '_tool_ledger',          # v6.89 记账（说「午饭 32」就记一笔）
+        'memorize': '_tool_memorize',
+        'offer_choices': '_tool_offer_choices',
+        'office_doc': '_tool_office_doc',   # v6.66 办公文档（WPS/Office COM）
+        'set_voice_summary': '_tool_set_voice_summary',   # v6.76 朗读摘要（只影响朗读）
+        'skill_pack': '_tool_skill_pack',   # v6.67 技能包管理（安装/权限/启停/卸载）
+        'open_app': '_tool_open_app',
+        'query_weather': '_tool_query_weather',
+        'read_clipboard': '_tool_read_clipboard',
+        'read_file': '_tool_read_file',
+        'run_powershell': '_tool_run_powershell',
+        'schedule_followup': '_tool_schedule_followup',
+        'search_code': '_tool_search_code',
+        'search_files': '_tool_search_files',
+        'set_reminder': '_tool_set_reminder',
+        'set_theme': '_tool_set_theme',
+        'skill_run': '_tool_skill_run',
+        'uninstall_plugin': '_tool_uninstall_plugin',
+        'web_search': '_tool_web_search',
+        'write_clipboard': '_tool_write_clipboard',
+        'write_config': '_tool_write_config',
+        'write_file': '_tool_write_file',
+    }
+
+    def _execute_tool(self, name, args):
+        """执行 AI 请求的工具，返回结果文本（v6.69：统一记审计 + 额度限制）"""
+        import governance as gov
+        t0 = time.time()
+        actor = None
+        if name.startswith('mcp_'):
+            actor = 'mcp:' + name.split('_', 2)[1]
+        elif name in self.plugin_mgr.tool_names():
+            actor = 'skill:' + self.plugin_mgr.tool_owner(name)
+        if actor:
+            ok_q, why_q, _used = gov.check_quota(actor)
+            if not ok_q:
+                gov.log_event('deny', actor, name, why_q, allowed=False)
+                return '（已限额）%s' % why_q
+        try:
+            if name.startswith('mcp_'):
+                # v6.68：写类 MCP 工具**先问过使用者再执行**（默认开，可在设置→MCP 关）
+                # v6.91：还要看聊天框里的权限档位（🛡 只问标了 destructiveHint 的，🔓 不问）
+                d = perm.gate_mcp(self.perm.level, self.mcp, name)
+                if d.need_ask:
+                    try:
+                        arg_txt = json.dumps(args, ensure_ascii=False)[:220]
+                    except Exception:
+                        arg_txt = str(args)[:220]
+                    if not self._request_confirm(
+                            '要调用外部 MCP 工具（%s）：\n%s\n参数：%s\n\n允许这一次吗？'
+                            % (d.why, name, arg_txt)):
+                        gov.log_event('deny', actor, name, '使用者拒绝（%s）' % d.why, allowed=False,
+                                      ms=(time.time() - t0) * 1000)
+                        return '（使用者拒绝了这次 MCP 工具调用：%s）' % name
+                elif d.delegated:
+                    perm.note_delegated(self.perm.level, 'MCP 工具 %s' % name)
+                # v6.20 MCP 工具转发：mcp_<server>_<tool>
+                out = self.mcp.call_tool(name, args)
+                gov.log_event('call', actor, name, out[:200], allowed=True,
+                              ms=(time.time() - t0) * 1000)
+                return out
+            if name in self.plugin_mgr.tool_names():
+                # v6.21 插件工具转发
+                out = self.plugin_mgr.handle_tool(name, args)
+                gov.log_event('call', actor, name, out[:200], allowed=True,
+                              ms=(time.time() - t0) * 1000)
+                return out
+            handler = self._TOOL_HANDLERS.get(name)
+            if handler is None:
+                return f'未知工具 {name}'
+            return getattr(self, handler)(args)
+        except Exception as e:
+            return f'工具执行失败：{e}'
+
+    def _tool_install_plugin(self, args):
+        # v6.21 AI 自主安装插件（校验+写入+热加载）
+        _, msg = self.plugin_mgr.install(
+            args.get('name', ''),
+            args.get('meta') or {},
+            args.get('entry_content'),
+            args.get('rules_content'))
+        return msg
+
+    def _tool_skill_pack(self, args):
+        """技能包管理（v6.67）：list/info/install/grant/enable/disable/uninstall"""
+        import skill_pack
+        args = args or {}
+        action = str(args.get('action') or 'list').strip()
+        name = str(args.get('name') or '').strip()
+        if action == 'list':
+            packs = self.plugin_mgr.packs()
+            if not packs:
+                return '还没装技能包。'
+            lines = ['已装技能包 %d 个：' % len(packs)]
+            for p in packs:
+                state = '启用' if p['enabled'] else ('待确认权限' if p['pending'] else '已禁用')
+                lines.append('· %s（%s v%s，来源 %s，%s）权限：%s'
+                             % (p['title'], p['name'], p['version'], p['source'], state,
+                                '、'.join(p['declared']) or '无'))
+            for n, why in (self.plugin_mgr.rejected or {}).items():
+                lines.append('· ⚠ %s 被安全策略拦下未载入：%s' % (n, why))
+            return '\n'.join(lines)
+        if action == 'info':
+            if not name:
+                return '请告诉我要看哪个技能包（name）。'
+            return skill_pack.permissions_card(self.plugin_mgr.dir, name) or '没找到技能包 %s' % name
+        if action == 'install':
+            ok, msg = self.plugin_mgr.install_pack(args.get('path'))
+            return msg
+        if action == 'grant':
+            perms = [x.strip() for x in str(args.get('permissions') or '').replace('，', ',').split(',') if x.strip()]
+            ok, msg = self.plugin_mgr.grant(name, perms)
+            return msg
+        if action in ('enable', 'disable'):
+            ok, msg = self.plugin_mgr.set_enabled(name, action == 'enable')
+            return msg
+        if action == 'uninstall':
+            ok, msg = self.plugin_mgr.uninstall(name)
+            return msg
+        return '未知 action：%s' % action
+
+    def _tool_uninstall_plugin(self, args):
+        _, msg = self.plugin_mgr.uninstall(args.get('name', ''))
+        return msg
+
+    def _tool_list_plugins(self, args):
+        return self.plugin_mgr.status_text()
+
+    def _tool_set_theme(self, args):
+        # v6.23 主题切换（default / theme 插件名）；v6.25.1 GUI 应用回主线程（防跨线程崩溃）
+        tname = str(args.get('name') or 'default').strip()
+        available = ['default'] + [str(x) for x in self.plugin_mgr.theme_names()]
+        if tname not in available:
+            return f'（可用主题：{"、".join(available)}）'
+        # 数据部分（线程安全）立即更新（与右键菜单入口共用同一方法）
+        self._set_theme_data(tname)
+        # GUI 部分回主线程执行（v6.58：改用跨线程信号——工作线程里 QTimer.singleShot 不会触发）
+        self._run_on_ui(self._apply_theme)
+        self._save_cfg_value('theme', tname)
+        return f'✅ 已切换主题：{tname}（样式已生效）'
+
+    # ---------- v6.66：办公文档工具（表格 / 报表 / PDF） ----------
+    OFFICE_OUT_DIR = os.path.join(BASE_DIR, '输出')
+
+    def _office_resolve(self, path, ext_default='.xlsx'):
+        """把 AI 给的路径收敛到 `输出/` 下（防穿越，与 write_file 同一策略）
+
+        AI 只能给出文件名，实际落在程序目录的 输出/ 里 —— 不让它往系统目录乱写。
+        """
+        safe = os.path.basename(str(path or '').strip().replace('\\', '/')) or ('报告' + ext_default)
+        root, ext = os.path.splitext(safe)
+        if ext.lower() not in ('.xlsx', '.xls', '.et', '.pdf', '.docx', '.doc', '.csv',
+                               '.pptx', '.ppt', '.dps'):
+            safe = (root or '报告') + ext_default
+        try:
+            os.makedirs(self.OFFICE_OUT_DIR, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(self.OFFICE_OUT_DIR, safe)
+
+    def _tool_office_doc(self, args):
+        """AI 调用：本机 WPS/Office 生成或读取表格与报表"""
+        import office_skill as off
+        action = str(args.get('action') or 'info').strip().lower()
+        if action not in ('info', 'write_sheet', 'read_sheet', 'make_report', 'export_pdf',
+                          'write_doc', 'write_slides'):
+            return ('未知 action：%s（可用：info / write_sheet / read_sheet / make_report / '
+                    'export_pdf / write_doc / write_slides）' % action)
+        path = str(args.get('path') or '').strip()
+        if action == 'info':
+            data, err = off.office_info(refresh=True)
+            if err and not data:
+                return '本机没有可用的办公接口（WPS / Office 都没装或不可用）：%s' % err
+            lines = ['本机可用的办公接口：']
+            for kind, item in (data or {}).items():
+                lines.append('  · %s → %s（版本 %s）'
+                             % (off.APP_LABEL.get(kind, kind), item['prog_id'], item['version']))
+            lines.append('可用 office_doc 的 write_sheet / make_report / read_sheet / export_pdf 干活。')
+            return '\n'.join(lines)
+        if not path:
+            return '需要 path 参数（文件名即可，如 用量统计.xlsx / 报告.docx / 演示.pptx）'
+        # v6.67：按动作给对应的默认扩展名 —— 否则 PPT 会被“修正”成 .xlsx
+        _ext = {'write_doc': '.docx', 'write_slides': '.pptx', 'export_pdf': '.pdf'}.get(action, '.xlsx')
+        path = self._office_resolve(path, _ext)
+        if action == 'write_sheet':
+            return off.sheet_write(path, args.get('rows'),
+                                   sheet=str(args.get('sheet') or 'Sheet1'),
+                                   start=str(args.get('start') or 'A1'))[0]
+        if action == 'read_sheet':
+            rows, err = off.sheet_read(path, args.get('sheet'), args.get('cell_range'))
+            if err:
+                return err
+            if not rows:
+                return '表格是空的（或指定范围没有内容）'
+            shown = rows[:30]
+            body = '\n'.join(' | '.join(str(c) for c in r) for r in shown)
+            tail = '\n（共 %d 行，只显示前 30 行）' % len(rows) if len(rows) > 30 else ''
+            return '表格内容（%s）：\n%s%s' % (os.path.basename(path), body, tail)
+        if action == 'make_report':
+            return off.make_report(path, str(args.get('title') or ''),
+                                   args.get('headers'), args.get('rows'),
+                                   footer=str(args.get('footer') or ''))[0]
+        if action == 'export_pdf':
+            out = str(args.get('out') or '').strip()
+            out = self._office_resolve(out, '.pdf') if out else os.path.splitext(path)[0] + '.pdf'
+            return off.export_pdf(path, out)[0]
+        if action == 'write_doc':          # v6.67 Word 写入（python-docx）
+            paras = args.get('paragraphs')
+            if isinstance(paras, str):
+                try:
+                    paras = json.loads(paras)
+                except Exception:
+                    paras = [paras]
+            return off.make_doc(path, str(args.get('title') or ''),
+                                paras, args.get('headers'), args.get('rows'),
+                                subtitle=str(args.get('subtitle') or ''))[0]
+        if action == 'write_slides':       # v6.67 PPT 写入（python-pptx）
+            slides = args.get('slides')
+            if isinstance(slides, str):
+                try:
+                    slides = json.loads(slides)
+                except Exception:
+                    slides = [{'title': str(args.get('title') or ''), 'bullets': [slides]}]
+            msg, ok = off.make_slides(path, str(args.get('title') or ''), slides,
+                                      subtitle=str(args.get('subtitle') or ''))
+            return msg
+        return '（内部错误：未处理的 action %s）' % action
+
+    def _tool_skill_run(self, args):
+        # v6.23 复合技能：返回步骤清单，AI 逐步执行
+        sname = str(args.get('name') or '').strip()
+        steps = self.plugin_mgr.skill_steps(sname)
+        if steps is None:
+            avail = [str(x) for x in self.plugin_mgr.skill_names()]
+            return f'（未找到技能 {sname}；可用技能：{"、".join(avail) or "无"}）'
+        return steps
+
+    def _tool_open_app(self, args):
+        app = args.get('name', '')
+        return self._smart_open(app)
+
+    def _tool_get_time(self, args):
+        import datetime
+        return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def _tool_web_search(self, args):
+        return self._web_search(args.get('query', ''))
+
+    def _tool_search_code(self, args):
+        return search_code(args.get('keyword', ''), base_dir=BASE_DIR)
+
+    def _tool_read_file(self, args):
+        return read_own_file(args.get('path', ''), BASE_DIR, args.get('start_line'), args.get('end_line'))
+
+    def _tool_edit_own_code(self, args):
+        return edit_own_code(args.get('old_text', ''), args.get('new_text', ''),
+                                   args.get('start_line'), args.get('end_line'),
+                                   args.get('file', 'desktop_pet.py'), base_dir=BASE_DIR)
+
+    def _tool_write_file(self, args):
+        return write_file_tool(args.get('filename', ''), args.get('content', ''), base_dir=BASE_DIR)
+
+    def _tool_write_config(self, args):
+        return self._write_config_tool(args.get('key', ''), args.get('value', ''))
+
+    def _tool_calculate(self, args):
+        return calculate_expr(args.get('expr', ''))
+
+    def _tool_set_reminder(self, args):
+        sec = max(1, min(int(args.get('seconds', 60)), 86400))
+        text = args.get('text', '提醒')
+        self._add_reminder(sec, text)
+        return f'已设置 {sec} 秒后提醒：{text}'
+
+    def _tool_lock_screen(self, args):
+        pl.lock_screen()
+        return '已锁定屏幕'
+
+    def _tool_offer_choices(self, args):
+        # v6.30 情感选项：支持字符串或 {text, affect} 对象，返回特殊标记
+        raw = args.get('choices') or []
+        choices = []
+        for c in raw:
+            if isinstance(c, dict):
+                t = str(c.get('text') or '').strip()[:20]
+                if t:
+                    choices.append({'text': t, 'affect': c.get('affect') or c.get('affection')})
+            else:
+                t = str(c).strip()[:20]
+                if t:
+                    choices.append({'text': t, 'affect': None})
+        if len(choices) < 2:
+            return '需要至少 2 个选项'
+        self._pending_choices = choices[:3]
+        return '__CHOICES__'
+
+    def _tool_query_weather(self, args):
+        # 真正联网查天气（wttr.in，网络层拆至 tools_executor.query_weather）
+        return query_weather(args.get('city', '') or self.pet_city)
+
+    def _tool_run_powershell(self, args):
+        cmd = args.get('command', '')
+        # v6.91：问不问由聊天框里的权限档位决定
+        #   🔒 严格：跟以前一样（只读白名单外的都问）
+        #   🛡 只问真危险：写文件/开程序直接干，删/格式化/关机/改系统/杀进程才问
+        #   🔓 全放权：不问（但补一条审计，事后查得到）
+        d = perm.gate_powershell(self.perm.level, cmd)
+        if d.need_ask:
+            if self._request_confirm(f'检测到危险操作，是否允许执行？\n\n{cmd}'):
+                return _run_ps(cmd, skip_check=True)
+            return '用户拒绝了危险操作，未执行'
+        if d.delegated:
+            perm.note_delegated(self.perm.level, 'PowerShell: %s' % str(cmd)[:120])
+        # 闸门已经按当前档位判过了，执行时别再拦一次（否则 🛡 档放行的命令会被 run_ps 挡回来）
+        return _run_ps(cmd, skip_check=True)
+
+    def _tool_memorize(self, args):
+        return self._remember_fact(args.get('action', 'add'), args.get('content', ''), args.get('importance', 3), args.get('id', ''), args.get('role', 'both'))
+
+    def _tool_manage_todo(self, args):
+        return self._manage_todo(args.get('action', 'list'), args.get('text', ''), args.get('id', ''))
+
+    def _tool_schedule_followup(self, args):
+        sec = max(600, min(int(args.get('seconds', 3600)), 21600))
+        reason = (args.get('reason', '关心一下') or '').strip()
+        self._add_reminder(sec, reason, rtype='followup')
+        return f'已安排 {sec} 秒后回访：{reason}'
+
+    def _tool_read_clipboard(self, args):
+        txt = pl.clipboard_get()
+        if txt is None:
+            return '剪贴板没有文本内容'
+        return f'剪贴板内容（{len(txt)} 字符）：\n{txt[:1000]}' + ('…（过长已截断）' if len(txt) > 1000 else '')
+
+    def _tool_write_clipboard(self, args):
+        txt = args.get('text', '')
+        if not txt:
+            return '没有可写入的内容'
+        return '已写入剪贴板，用户可直接粘贴' if pl.clipboard_set(txt) else '剪贴板写入失败'
+
+    def _tool_get_system_info(self, args):
+        return _run_ps('$os = Get-CimInstance Win32_OperatingSystem; $cpu = Get-CimInstance Win32_Processor; $cs = Get-CimInstance Win32_ComputerSystem; "系统: $($os.Caption) $($os.Version)"; "CPU: $($cpu.Name)"; "内存: $([math]::Round(($os.TotalVisibleMemorySize/1MB),1)) GB 总量, $([math]::Round(($os.FreePhysicalMemory/1MB),1)) GB 可用"; "开机: $($os.LastBootUpTime)"; "用户: $($cs.UserName)"')
+
+    def _tool_list_processes(self, args):
+        n = int(args.get('n', 10))
+        return _run_ps(f'Get-Process | Sort-Object WS -Descending | Select-Object -First {n} Name, Id, @{{N="内存MB";E={{[math]::Round($_.WS/1MB)}}}} | Format-Table -AutoSize | Out-String -Width 100')
+
+    def _tool_kill_process(self, args):
+        proc = args.get('name', '').replace('.exe', '')
+        protected = {'system', 'svchost', 'explorer', 'winlogon', 'csrss', 'services', 'dwm', 'pythonw', 'python', 'autoclaw'}
+        if proc.lower() in protected:
+            return f'{proc} 是系统/关键进程，已保护，不能结束'
+        if not _is_safe_process_name(proc):
+            return f'进程名 {proc} 含非法字符，已拒绝（防命令注入）'
+        # skip_check：进程名已过白名单校验（仅字母数字._- 空格），
+        # 且 Stop-Process 是本工具的既定行为，不是 AI 自由拼串
+        return _run_ps('Get-Process -Name ' + _ps_quote(proc) +
+                       ' -ErrorAction SilentlyContinue | Stop-Process; '
+                       f'if ($?) {{ "已结束进程 {proc}" }} else {{ "未找到进程 {proc}" }}',
+                       skip_check=True)
+
+    def _tool_control_volume(self, args):
+        action = (args.get('action') or '').lower()
+        if action == 'set':
+            pct = int(args.get('percent', 50))
+            pct = max(0, min(100, pct))
+            return _volume_ps(f'[Volume]::SetPercent({pct}); "已精确设置音量 {pct}%"')
+        if action in ('mute', 'unmute'):
+            flag = 'true' if action == 'mute' else 'false'
+            return _volume_ps(f'[Volume]::SetMuted({flag}); "已{"静音" if action == "mute" else "取消静音"}"')
+        if action in ('up', 'down'):
+            steps = max(1, min(int(args.get('steps', 5)), 100))
+            op = '+' if action == 'up' else '-'
+            return _volume_ps(f'$cur = [Volume]::GetPercent(); $new = [math]::Max(0, [math]::Min(100, $cur {op} {steps})); [Volume]::SetPercent($new); "音量 $cur% → $new%"')
+        return '音量操作只能是 set/up/down/mute/unmute'
+
+    def _tool_search_files(self, args):
+        fname = (args.get('name') or '').strip()
+        fpath = (args.get('path') or os.path.expanduser('~')).strip()
+        if not fname:
+            return '请提供文件名关键词'
+        cmd = ('Get-ChildItem -LiteralPath ' + _ps_quote(fpath) +
+               ' -Recurse -Filter ' + _ps_quote('*' + fname + '*') +
+               ' -File -ErrorAction SilentlyContinue '
+               '| Select-Object -First 10 FullName | Out-String -Width 200')
+        result = _run_ps(cmd, timeout=12)
+        if '（' in result and 'Error' in result:
+            return result
+        return result if result and '（无输出' not in result else f'没找到包含 "{fname}" 的文件'
+
+    # ================= 窄接口（v6.51：为"搬模块"重构解耦测试而加） =================
+    # 回归测试原先直接读写宿主的私有属性（_stream_text / _thinking_label / api_stats /
+    # current …），这会让任何一次内部改名都变成"测试大面积变红"，重构寸步难行。
+    # 这里把测试与外部模块真正需要的状态收敛成五个入口：读用 snapshot()/ui_probe()，
+    # 写用 set_state()（白名单键，写错键名直接报错，避免悄悄写坏内部状态）。
+
+    def snapshot(self):
+        """只读状态快照（对外契约）"""
+        return {
+            'char': self.current,
+            'model': self._current_model(),
+            'endpoint': self._current_endpoint(),
+            'language': getattr(self, 'language', 'zh'),
+            'max_tokens': getattr(self, 'max_tokens', None),
+            'temperature': getattr(self, 'temperature', None),
+            'theme': dict(getattr(self, 'theme', {}) or {}),
+            'current_theme': getattr(self, 'current_theme', 'default'),
+            'edge_mode': getattr(self, '_edge_mode', 'peek'),
+            'display_mode': getattr(self, 'display_mode', 'static'),
+            'personality': getattr(self, 'personality', ''),
+            'reply_style': getattr(self, 'reply_style', 'normal'),
+            'active_care': bool(getattr(self, 'active_chat_enabled', False)),
+            'dock_probe': bool(getattr(self, 'dock_probe', False)),
+            'balance_low_threshold': getattr(self, 'balance_low_threshold', None),
+            'balance': getattr(self.api_stats, 'balance', None),
+            'ai_enabled': bool(getattr(self, 'ai_enabled', False)),
+            'chat_msgs': list(getattr(self, 'chat_history_msgs', []) or []),
+            'memory_summaries': list(getattr(self, 'memory_summaries', []) or []),
+            'api_stats': getattr(self, 'api_stats', None),
+        }
+
+    _SET_STATE_KEYS = anim.SET_STATE_KEYS  # 白名单已搬至 pet_anim（批 4）
+
+    def set_state(self, **kw):
+        """受控写入口：只接受白名单键（写错立刻报错，不静默写坏状态）
+        （实现已搬至 pet_anim.set_state / SET_STATE_KEYS）"""
+        return anim.set_state(self, **kw)
+    def ui_probe(self):
+        """UI 探针（只读）：流式/思考/状态行/选项按钮的可见状态"""
+        def _txt(w):
+            try:
+                return w.text() if w is not None else None
+            except Exception:
+                return None
+        bubble = getattr(self, '_chat_type_bubble', None)
+        btns = []
+        if bubble is not None:
+            try:
+                btns = [b.text() for b in bubble.findChildren(QPushButton)]
+            except Exception:
+                btns = []
+        lbl = getattr(self, '_thinking_label', None)
+        return {
+            'stream_text': getattr(self, '_stream_text', ''),
+            'thinking_text': _txt(lbl),
+            'thinking_hidden': bool(lbl.isHidden()) if lbl is not None else True,
+            'status_widget': getattr(self, '_status_widget', None) is not None,
+            'bubble_text': _txt(bubble),
+            'choice_buttons': btns,
+        }
+
+    def ui_clear_handles(self):
+        """测试用：清空流式/思考区控件句柄（模拟新一轮对话开始前的状态）"""
+        self._chat_type_bubble = None
+        self._thinking_label = None
+        self._stream_label = None
+
+    def ui_thinking_toggle(self):
+        """测试用：思考区折叠按钮句柄（点它验证折叠/展开）"""
+        return getattr(self, '_thinking_toggle', None)
+
+    def _ai_worker(self, text, images=None):
+        """后台线程：调用 DeepSeek API（支持 function calling 循环）
+
+        v6.62：images 为本地图片路径 → 直接随消息送给模型（视觉）；
+        编码失败时自动回退本地 OCR，不让用户白等。
+        """
+        import urllib.request
+        import json as jsonlib
+
+        def _post(data, status_zh, status_en):
+            """API 请求（网络层已拆至 deepseek_client，此处薄封装：注入 key/语言/状态信号/用量记录）"""
+            is_en = getattr(self, 'language', 'zh') == 'en'
+            resp = chat_completions(
+                self._current_api_key(), data,
+                status_cb=lambda s: self.ai_status_signal.emit(s),
+                status_zh=status_zh, status_en=status_en, is_en=is_en,
+                endpoint=self._request_endpoint(),
+            )
+            self._record_api_usage(resp)
+            return resp
+
+        def _post_stream(data, status_zh, status_en):
+            """SSE 流式（网络层已拆至 deepseek_client，薄封装）"""
+            is_en = getattr(self, 'language', 'zh') == 'en'
+            yield from stream_chat_completions(
+                self._current_api_key(), data,
+                status_cb=lambda s: self.ai_status_signal.emit(s),
+                status_zh=status_zh, status_en=status_en, is_en=is_en,
+                endpoint=self._request_endpoint(),
+                # v6.53：把“该不该停”交给 UI 侧 —— 代次一变立即断流
+                should_cancel=lambda: getattr(self, '_ai_generation', 0) != getattr(self, '_cur_gen', -1),
+            )
+
+        try:
+            # v6.43：记录本次任务代次（用于强制停止判断）
+            self._cur_gen = getattr(self, '_ai_generation', 0)
+            aborted = False          # v6.53：流内被取消标志（避免后续再发请求）
+            # v6.43 fix：闭合悬空任务——上次中断遗留的 user 无 assistant 回复，
+            # 不闭合则下次对话 AI 会误继续执行旧任务（如：卡住的"找文件夹"在你说 evening 时复活）
+            self._close_pending_user_msg()
+            # v6.40 fix：用户消息立即入历史并保存（AI 回复中断/进程退出也不丢用户说的话）
+            self.chat_history_msgs.append({'role': 'user', 'content': text})
+            self._save_chat_memory()
+            # 旧消息超 20 条 → 先滚动摘要（不阻塞主流程）
+            self._summarize_old()
+            # 意图预判：秒出状态提示（猜测，工具确认后覆盖）
+            gs = self._guess_status(text)
+            self.ai_status_signal.emit(gs[1] if getattr(self, 'language', 'zh') == 'en' else gs[0])
+            # 上下文：最近 10 条 + 当前消息
+            ctx = self.chat_history_msgs[-30:] + [{'role': 'user', 'content': text}]
+            # v6.62：官方称带 tools 时应回传历史思考内容（只补上一轮，已截断）
+            if getattr(self, 'pass_reasoning_history', True):
+                ctx = self._with_reasoning_history(ctx)
+            # v6.62：图片直送模型（成功则当前这条 user 消息带图；失败回退 OCR）
+            if images:
+                _vcontent, _vused, _verrs = self._vision_content(text, images)
+                if _vused:
+                    ctx[-1] = {'role': 'user', 'content': _vcontent}
+                else:
+                    _fallback = []
+                    for _p in images:
+                        try:
+                            _fallback.append('【%s OCR】\n%s'
+                                             % (os.path.basename(str(_p)), pl.ocr_image(_p, OCR_PS1)))
+                        except Exception:
+                            _fallback.append('【%s】（OCR 失败）' % os.path.basename(str(_p)))
+                    if _fallback:
+                        ctx[-1] = {'role': 'user', 'content': (text or '') + '\n\n' + '\n\n'.join(_fallback)}
+                    else:
+                        self._notify('图片直读失败，且本地识别也没读到内容')
+                    if _verrs:
+                        _silent_log('_vision_fallback', _verrs)
+            # 根据配置生成回复风格提示
+            style_hint = {
+                'short': '回复尽量简短（一两句话以内）。',
+                'detailed': '分析类问题可以详细回答，允许用列表/表格，不必受简短限制。',
+                'normal': '回答简短可爱，但分析类问题可以稍详细。',
+            }.get(getattr(self, 'reply_style', 'normal'), '回答简短可爱。')
+            # 长期记忆注入（v6.41：core + 按问题检索相关记忆）
+            mem = self._memory_block()
+            try:
+                # BM25 粗筛 + 相关性闸门 + LLM 重排 top-3（memory_engine）
+                # v6.53：没过闸门 → 返回空表 → 本轮不注入检索记忆（治记忆过拟合）
+                rel = search_memory_for_injection(self.memory_facts, text, top_k=3,
+                                                  rerank=self._rerank_memories)
+                if rel:
+                    rel_block = '\n'.join(f'★{c.get("importance", 3)} {c["text"]}' for c in rel)
+                    mem = (rel_block + '\n\n' + mem) if mem else rel_block
+            except Exception as _exc:
+                _silent_log('_post_stream:2091', _exc)   # v6.54
+            # v6.53：记忆只作背景、不做话题（治“问什么都往已记住的事上靠”的过拟合）
+            mem_use_rule = ('\n【记忆的使用方式（重要）】上面这些记忆只是背景参考：'
+                            '仅当用户当前问题与之直接相关时才引用；不要主动把话题引向记忆，'
+                            '不要为了显得“记得”而提及记忆，也不要因为记忆里有某件事'
+                            '就默认用户这次想聊它。')
+            mem_hint = f'\n\n【你的长期记忆】\n{mem}{mem_use_rule}' if mem else ''
+            mem_rule = '\n当你发现用户的重要偏好/个人事实/任务目标时，调用 memorize 工具记住它；用户明确说"忘了/不要记住"时用 memorize 删除对应记忆。' if mem else '\n记忆规则：当你发现用户的重要偏好/个人事实/任务目标时，调用 memorize 工具记住它。'
+            # 插件规则注入（v6.21：rules 类插件内容拼进 system prompt）
+            plugin_rules = self.plugin_mgr.rules_text()
+            plugin_rules_hint = f'\n\n【插件规则】\n{plugin_rules}' if plugin_rules else ''
+            # 待办清单注入
+            todo_block = self._todo_block()
+            todo_hint = f'\n\n【待办清单】\n{todo_block}' if todo_block else ''
+            cur_model = self._current_model()
+            # 语言指示：AI 回复语言跟随配置
+            lang_hint = self._t('lang_hint')
+            # v6.30 好感度：人设阶段 + 最近回忆注入（动态随好感度进化）
+            affection_hint = ''
+            try:
+                _stage_t = self.affection.stage_prompt(self.current)
+                _mem_t = self.memories.prompt_hint(self.current)
+                if _stage_t or _mem_t:
+                    affection_hint = '\n\n【关系与回忆（随好感度动态进化）】' + f'\n{_stage_t}' + (_mem_t or '')
+            except Exception:
+                affection_hint = ''
+            # 角色身份锚定：名字优先级 系统设定 > 记忆中的角色命名
+            char_name = CHARACTERS[self.current]['name']
+            role_anchor = f'你是{char_name}（角色：{self.current}，模型：{cur_model}）。回答"你是谁"时先明确你是{char_name}（{self.current}）；如果长期记忆中有用户给你起的名字（如小蓝/大蓝），按角色对应使用（只认与你当前角色匹配的名字），不要混用其他角色的名字。'
+            messages = [
+                {'role': 'system', 'content': build_system_prompt(
+                    CHARACTERS[self.current]['name'], self.current, cur_model, self.personality,
+                    style_hint, lang_hint, mem_hint, todo_hint, mem_rule, plugin_rules_hint, affection_hint)},
+            ] + ctx
+
+            # 最多 5 轮工具调用；空回复自动重试（防截断/空content）
+            final_reply = None
+            empty_retries = 0
+            for _ in range(5):
+                # v6.43：被新任务取代或 /stop → 静默退出（不 emit 内容）
+                if getattr(self, '_ai_generation', 0) != getattr(self, '_cur_gen', -1):
+                    self._log_ai_abort('round-boundary')
+                    return
+                # 请求阶段：覆盖预判为确定状态；v6.40 真流式（SSE）
+                self.ai_status_signal.emit('正在思考…' if getattr(self, 'language', 'zh') != 'en' else 'Thinking…')
+                data = jsonlib.dumps(dict({
+                    'model': cur_model,
+                    'messages': messages,
+                    # v6.53：工具按模式暴露（默认 core 8 个；MCP/插件工具始终保留）
+                    # v6.62：开了 strict 时这里输出严格版 schema
+                    'tools': self._tools_payload(cur_model),
+                    'max_tokens': getattr(self, 'max_tokens', 1000),
+                    'stream': True,
+                    'stream_options': {'include_usage': True},  # v6.40 fix：流式返回 usage（api_stats 统计）
+                    'temperature': getattr(self, 'temperature', 1.0),
+                    # v6.62：思考开关 + 强度真正进请求体（原先只驱动 UI，等于没关）
+                }, **self._thinking_fields())).encode()
+                self.stream_done_signal.emit()  # 上一轮流式收尾（防残留）
+                full = None
+                aborted = False
+                _round_rsn = ''
+                for evt, val in _post_stream(data, '正在思考…', 'Thinking…'):
+                    # v6.53：逐块检查代次 —— /stop 或新任务顶替时立刻停止回显
+                    if getattr(self, '_ai_generation', 0) != getattr(self, '_cur_gen', -1):
+                        aborted = True
+                        self._log_ai_abort('stream')
+                        break
+                    if evt == 'reasoning':
+                        self.reasoning_signal.emit(val)
+                    elif evt == 'content':
+                        self.stream_signal.emit(val)
+                    elif evt == 'done':
+                        full = val
+                if aborted:
+                    break
+                if full is None:
+                    raise RuntimeError('流式响应为空')
+                _round_rsn = full.get('reasoning_content') or ''
+                # 记录 API 用量（v6.40 fix：stream_options.include_usage 后流式响应带 usage）
+                if full.get('usage'):
+                    try:
+                        self._record_api_usage({'usage': full['usage']}, fallback_model=cur_model)
+                    except Exception as _exc:
+                        _silent_log('_post_stream:2170', _exc)   # v6.54
+                msg = {
+                    'role': 'assistant',  # v6.40 fix：缺 role 导致工具调用后第二轮请求 400（DeepSeek 报 role 错误）
+                    'content': full.get('content') or '',
+                    'tool_calls': full.get('tool_calls'),
+                    'reasoning_content': full.get('reasoning_content') or '',
+                }
+                self.stream_done_signal.emit()
+                messages.append(msg)
+
+                # 检查是否有工具调用
+                tool_calls = msg.get('tool_calls') or []
+                content = (msg.get('content') or '').strip()
+                if not tool_calls:
+                    if content:
+                        final_reply = content
+                        break
+                    # content 为空：重试（不带工具强制纯文本回复）
+                    if empty_retries < 2:
+                        empty_retries += 1
+                        data2 = jsonlib.dumps({
+                            'model': cur_model,
+                            'messages': messages[:-1] + [{'role': 'user', 'content': '请用简短中文回复上一条消息（不要调用工具）'}],
+                            'max_tokens': min(4096, int(getattr(self, 'max_tokens', 4096) or 4096)),  # v6.53：原先写死 500 会截断
+                            # v6.62：空回复属于“该直接说话”的场景，关掉思考直接出正文，省 token 也省时
+                            'thinking': {'type': 'disabled'},
+                        }).encode()
+                        result2 = _post(data2, '正在思考…', 'Thinking…')
+                        final_reply = (result2['choices'][0]['message'].get('content') or '').strip() or '（我刚才卡壳了，换个说法再问我一次？）'
+                        break
+                    final_reply = '（我刚才卡壳了，换个说法再问我一次？）'
+                    break
+
+                # 执行工具
+                for tc in tool_calls:
+                    fn = tc['function']
+                    name = fn['name']
+                    args = jsonlib.loads(fn.get('arguments') or '{}')
+                    is_en = getattr(self, 'language', 'zh') == 'en'
+                    st = TOOL_STATUS.get(name, (f'正在执行 {name}', f'Running {name}'))
+                    self.ai_status_signal.emit((st[1] if is_en else st[0]) + '…')
+                    result_text = self._execute_tool(name, args)
+                    if result_text == '__CHOICES__':
+                        # v6.30 情感选项：保留 AI 简短正文，暂停对话流等用户点击
+                        final_reply = (msg.get('content') or '').strip()
+                        self._choices_requested = True
+                        break
+                    messages.append({
+                        'role': 'tool',
+                        'tool_call_id': tc['id'],
+                        'content': result_text,
+                    })
+                if getattr(self, '_choices_requested', False):
+                    break
+
+            if final_reply is None and not aborted:
+                # 工具轮次耗尽但没生成文本回复：强制不带工具重试一次
+                self.ai_status_signal.emit('正在整理结果…' if getattr(self, 'language', 'zh') != 'en' else 'Preparing result…')
+                try:
+                    data3 = jsonlib.dumps({
+                        'model': cur_model,
+                        'messages': messages + [{'role': 'user', 'content': '请用简短中文总结一下刚才的处理结果（不要调用工具）'}],
+                        'max_tokens': min(4096, int(getattr(self, 'max_tokens', 4096) or 4096)),  # v6.53：原先写死 300 会截断
+                    }).encode()
+                    result3 = _post(data3, '正在整理结果…', 'Preparing result…')
+                    final_reply = (result3['choices'][0]['message'].get('content') or '').strip()
+                except Exception:
+                    final_reply = None
+                if not final_reply:
+                    final_reply = '（刚才分析到一半走神了，换个问法再试一次？）'
+
+            # 保存到对话记忆（占位/错误回复不存；user 消息已在开头保存，此处只存 assistant）
+            if final_reply and not final_reply.startswith('（'):
+                # v6.40 fix：上下文存剥标签后的回复（原始含[emotion:xxx]会污染上下文+被AI模仿输出）
+                _clean_reply = self._strip_emotion_tags(final_reply)[0]
+                self.chat_history_msgs.append({'role': 'assistant', 'content': _clean_reply})
+                # v6.62：记下本轮思考内容（下次带 tools 的请求会回传给模型）
+                self._remember_reasoning(_clean_reply, _round_rsn)
+            # v6.30 好感度：对话完成事件（占位/错误回复不计）
+            if final_reply and not final_reply.startswith('（'):
+                try:
+                    self._handle_affection(self.affection.trigger(self.current, 'chat'))
+                except Exception as _exc:
+                    _silent_log('_post_stream:2248', _exc)   # v6.54
+            if getattr(self, '_ai_generation', 0) != getattr(self, '_cur_gen', -1):
+                return  # v6.43：已被新任务取代，静默丢弃本次回复
+            self.ai_reply_signal.emit(final_reply)
+            # v6.63：语音朗读（P0）—— 默认关；开着的话读一遍刚刚这句话
+            self._speak_reply(final_reply)   # v6.63
+            self._voice_summary = ''          # v6.76：摘要只对当前这一轮有效
+            # v6.41 自动记忆抽取（低频：间隔 30 分钟且 ≥4 轮对话）
+            try:
+                self._maybe_extract_memory()
+            except Exception as _exc:
+                _silent_log('_post_stream:2256', _exc)   # v6.54
+        except Exception as e:
+            # 400 等 HTTP 错误：显示响应体中的具体原因（DeepSeek error.message）
+            try:
+                import urllib.error as _ue
+                if isinstance(e, _ue.HTTPError):
+                    body = e.read().decode('utf-8', 'replace')
+                    detail = body
+                    try:
+                        detail = jsonlib.loads(body).get('error', {}).get('message') or body[:200]
+                    except Exception as _exc:
+                        _silent_log('_post_stream:2267', _exc)   # v6.54
+                    self.ai_reply_signal.emit(f'（AI 出错了：HTTP {e.code} — {detail}）')
+                else:
+                    self.ai_reply_signal.emit(f'（AI 出错了：{e}）')
+            except Exception:
+                self.ai_reply_signal.emit(f'（AI 出错了：{e}）')
+        finally:
+            # v6.43b：仅当代任务清 busy，然后自动执行队列下一任务（FCFS）
+            # v6.53：被 /stop 顶替的旧线程，退出后再接续队列（_stop_ai 只置 _pending_resume）
+            cur_gen_ok = getattr(self, '_ai_generation', 0) == getattr(self, '_cur_gen', -1)
+            if cur_gen_ok or getattr(self, '_pending_resume', False):
+                self._pending_resume = False
+                self._ai_busy = False
+                self._cur_task_text = None
+                try:
+                    self._refresh_task_sidebar()
+                except Exception as _exc:
+                    _silent_log('_post_stream:2284', _exc)   # v6.54
+                self._next_task()
+
+    EMOTION_STATE_MAP = {
+        'happy': 'happy', 'excited': 'excited', 'calm': 'idle',
+        'thinking': 'thinking', 'sleep': 'sleep', 'tired': 'sleep',
+        'shy': 'shy', 'angry': 'angry', 'sad': 'sad', 'cry': 'sad',
+    }
+    EMOTION_EMOJI_MAP = {
+        'happy': '😊', 'excited': '🎉', 'calm': '😌',
+        'thinking': '🤔', 'sleep': '💤', 'tired': '😪',
+        'shy': '😳', 'angry': '😠', 'sad': '😢', 'cry': '😭',
+    }
+
+    @staticmethod
+    def _strip_emotion_tag(text):
+        """剥离文本中的 [emotion:xxx] / [emotion=xxx] 标签，返回 (剥离后的文本, 情绪名或None)
+        （实现已搬至 pet_bubble.strip_emotion_tag）"""
+        return pb.strip_emotion_tag(text)
+    def _apply_emotion(self, emotion):
+        """应用情绪：切立绘 + emoji 气泡 + 定时恢复（10 秒，可重启不叠加）"""
+        if self.sleeping:
+            return  # 睡觉时不切情绪立绘（AI 回复照常显示，但立绘保持睡眠图）
+        target_state = self.EMOTION_STATE_MAP.get(emotion)
+        if not target_state:
+            return
+        self._show_state_image(target_state)
+        self.show_emotion(self.EMOTION_EMOJI_MAP.get(emotion, '✨'), 2000)
+        if self._emotion_restore_timer is None:
+            self._emotion_restore_timer = QTimer(self)
+            self._emotion_restore_timer.setSingleShot(True)
+            self._emotion_restore_timer.timeout.connect(self._restore_state_after_emotion)
+        self._emotion_restore_timer.start(5000)  # 表情持续 5 秒后恢复 idle
+
+    # ---------- v6.40 真流式渲染（思考+正文同卡片，AutoClaw 风格） ----------
+    def _chat_type_stream_begin(self):
+        """流式渲染开始：创建气泡（思考折叠区 + 正文流式区）"""
+        # v6.76：增量渲染的进度跟踪（每个气泡重新计数）
+        self._stream_done_blocks = 0
+        self._stream_last_render = 0.0
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime('%m-%d %H:%M')
+        self._remove_status_line()
+        self._chat_type_bubble, self._chat_type_content = self._new_bubble('桌宠', ts, is_user=False, text='')
+        # 思考折叠区（同卡片顶部，AutoClaw 风格）
+        try:
+            head = self._chat_type_bubble.layout().itemAt(0).layout()
+            thinking_toggle = QPushButton('💭 思考过程 ▼')
+            self._set_themed_qss(thinking_toggle, lambda: (
+                'QPushButton { background:transparent; color:%s; border:none;'
+                ' font-size:11px; padding:0; text-align:left; }'
+                'QPushButton:hover { color:%s; }'
+                % (self._tk('ui_status_text'), self._tk('ui_accent_soft'))))
+            thinking_toggle.setCursor(Qt.PointingHandCursor)
+            thinking_toggle._collapsed = False
+            def _toggle():
+                # v6.40 fix：闭包捕获本气泡局部变量（旧代码引用 self._thinking_* 最新值，
+                # 导致多轮对话后旧气泡的折叠按钮操作的是最新气泡——旧对话无法折叠）
+                collapsed = not getattr(thinking_toggle, '_collapsed', False)
+                thinking_toggle._collapsed = collapsed
+                if thinking_label is not None:
+                    thinking_label.setVisible(not collapsed)
+                thinking_toggle.setText('💭 思考过程 ▶' if collapsed else '💭 思考过程 ▼')
+            thinking_toggle.clicked.connect(_toggle)
+            head.insertWidget(2, thinking_toggle)
+            head.insertStretch(3, 1)
+            self._thinking_toggle = thinking_toggle
+            self._thinking_collapsed = False
+        except Exception:
+            self._thinking_toggle = None
+        thinking_label = QLabel('')
+        thinking_label.setWordWrap(True)
+        thinking_label.setTextFormat(Qt.PlainText)
+        self._set_themed_qss(thinking_label, lambda: (
+            'color:%s; font-size:12px; background:%s; border-radius:6px; padding:6px;'
+            % (self._tk('ui_status_text'), self._tk('ui_input_bg'))))
+        thinking_label.hide()  # 无思考时不占位
+        self._chat_type_content.addWidget(thinking_label)
+        self._thinking_label = thinking_label
+        # 正文流式区
+        self._stream_label = QLabel('')
+        self._stream_label.setWordWrap(True)
+        self._stream_label.setTextFormat(Qt.PlainText)
+        self._set_themed_qss(self._stream_label,
+                             lambda: f'color:{self._tk("bubble_text")}; font-size:14px;')
+        self._chat_type_content.addWidget(self._stream_label)
+        self._chat_scroll_bottom()
+        self._stream_active = True
+
+    def _strip_emotion_tags(self, combined):
+        """过滤 emotion 控制标签（跨 chunk 安全）。返回 (清理文本, 未闭合尾缀, 提取到的情绪列表)
+        （实现已搬至 pet_bubble.strip_emotion_tags）"""
+        return pb.strip_emotion_tags(combined)
+    def _on_stream(self, chunk):
+        """主线程槽：流式正文 chunk → 直接渲染（真流式，无卡顿）"""
+        try:
+            if not self._stream_active:
+                if (getattr(self, '_thinking_label', None) is not None
+                        and getattr(self, '_chat_type_content', None) is not None
+                        and self._thinking_label.parent() is not None):
+                    # v6.40 fix：工具调用轮次续用——思考区已在本气泡，复用气泡只重建正文 label
+                    self._stream_label = QLabel('')
+                    self._stream_label.setWordWrap(True)
+                    self._stream_label.setTextFormat(Qt.PlainText)
+                    self._set_themed_qss(self._stream_label,
+                                         lambda: f'color:{self._tk("bubble_text")}; font-size:14px;')
+                    self._chat_type_content.addWidget(self._stream_label)
+                else:
+                    self._chat_type_stream_begin()
+                self._stream_active = True
+            # v6.41 fix：正文渲染即标记（reasoning 先触发 begin 后 content 到达也必须标记，
+            # 否则 _display_ai_reply 误走非流式分支 → 正文重复打字机渲染 + 情感选项不弹出）
+            self._stream_rendered = True
+            combined = getattr(self, '_stream_pending', '') + chunk
+            cleaned, pending, emotions = self._strip_emotion_tags(combined)
+            self._stream_pending = pending
+            for emo in emotions:
+                try:
+                    self._apply_emotion(emo)
+                except Exception as _exc:
+                    _silent_log('_on_stream:2397', _exc)   # v6.54
+            if not cleaned:
+                return
+            self._stream_text += cleaned
+            if self._stream_label is not None:
+                self._stream_label.setText(self._stream_text)
+                self._chat_scroll_bottom()
+            # ★ v6.76 增量 markdown 渲染：不等全文，按“整块+节流”边出边渲染
+            self._maybe_incremental_render()
+        except Exception as _exc:
+            _silent_log('_on_stream:2405', _exc)   # v6.54
+
+    def _stream_new_label(self):
+        """建一个新的流式正文 label（重渲染后需要重建，因为重渲染会清掉布局里的控件）"""
+        lb = QLabel('')
+        lb.setWordWrap(True)
+        lb.setTextFormat(Qt.PlainText)
+        self._set_themed_qss(lb, lambda: f'color:{self._tk("bubble_text")}; font-size:14px;')
+        content = getattr(self, '_chat_type_content', None)
+        if content is not None:
+            content.addWidget(lb)
+        return lb
+
+    def _maybe_incremental_render(self):
+        """增量渲染（v6.76）——使用者反馈“想边输出边渲染”
+
+        策略（保守、不打扰流式手感）：
+          · 只在正文里出现 markdown 迹象时才做（纯文本仍走快路径）
+          · 只在“已完成块数增加”时做（块级提交，不会每字重渲染）
+          · 硬限流：最快每 200ms 一次（避免长回复时把主线程抽干）
+        重渲染会清掉布局里的正文控件（含流式 label）→ 重建一个空 label 继续接后续 chunk。
+        """
+        import time as _t
+        try:
+            text = getattr(self, '_stream_text', '') or ''
+            if not text.strip() or not self._has_md_markup(text):
+                return
+            blocks = self._split_rich_blocks(text)
+            done_blocks = max(0, len(blocks) - 1)      # 最后一块可能还没写完 → 先不提交
+            if done_blocks <= 0 or done_blocks <= getattr(self, '_stream_done_blocks', 0):
+                return
+            now = _t.monotonic()
+            if now - getattr(self, '_stream_last_render', 0.0) < 0.2:
+                return
+            self._stream_done_blocks = done_blocks
+            self._stream_last_render = now
+            self._rerender_rich(text)
+            # 重渲染清掉了所有正文控件 → 重建流式 label 接着接 chunk
+            self._stream_label = self._stream_new_label()
+            self._stream_label.setText(text.split('\n\n')[-1] if '\n\n' in text else text)
+            self._chat_scroll_bottom()
+        except Exception as _exc:
+            _silent_log('_maybe_incremental_render', _exc)
+
+    def _on_reasoning(self, chunk):
+        """主线程槽：流式思考 chunk → 同卡片灰色思考区（可折叠）；过滤 emotion 标签"""
+        try:
+            if self._thinking_label is None:
+                self._chat_type_stream_begin()
+                self._stream_rendered = True
+            if self._thinking_label is None:
+                return
+            combined = getattr(self, '_thinking_pending', '') + chunk
+            cleaned, pending, _emotions = self._strip_emotion_tags(combined)
+            self._thinking_pending = pending
+            if not cleaned:
+                return
+            if not self._thinking_label.isVisible():
+                self._thinking_label.show()
+            self._thinking_label.setText('💭 ' + self._thinking_label.text()[2:] + cleaned)
+            self._chat_scroll_bottom()
+        except Exception:
+            pass
+
+    def _on_stream_done(self):
+        """主线程槽：流式结束（清状态行；思考区保留在卡片内可折叠）"""
+        self._stream_active = False
+        # flush 残留 pending（若流结束时仍未凑成标签 → 是普通文本，显示出来）
+        if getattr(self, '_stream_pending', ''):
+            self._stream_text += self._stream_pending
+            self._stream_pending = ''
+            if self._stream_label is not None:
+                self._stream_label.setText(self._stream_text)
+                self._chat_scroll_bottom()
+        if getattr(self, '_thinking_pending', ''):
+            if self._thinking_label is not None:
+                self._thinking_label.setText('💭 ' + self._thinking_label.text()[2:] + self._thinking_pending)
+            self._thinking_pending = ''
+        self._stream_label = None
+        try:
+            self._remove_status_line()
+        except Exception:
+            pass
+
+    # ---------- v6.40 流式富文本恢复 ----------
+    @staticmethod
+    def _looks_like_table(text):
+        """粗略判断：多行且含管道符的表格（拆至 chat_render.looks_like_table）"""
+        return looks_like_table(text)
+
+    def _rerender_rich(self, text):
+        """流式结束后：把纯文本气泡重渲染为富文本（代码卡/表格卡，含复制按钮）"""
+        content = getattr(self, '_chat_type_content', None)
+        if content is None:
+            return
+        thinking = getattr(self, '_thinking_label', None)
+        while content.count():
+            item = content.takeAt(0)
+            w = item.widget()
+            if w is thinking:
+                continue  # v6.40 fix：思考区保留，不被重渲染清掉（否则折叠后无法展开）
+            if w:
+                w.deleteLater()
+        blocks = self._split_rich_blocks(text)
+        for kind, c in blocks:
+            self._render_one_block(content, kind, c)
+        if thinking is not None:
+            content.insertWidget(0, thinking)  # 思考区保持在正文上方
+            thinking.setVisible(not getattr(self, '_thinking_collapsed', False) and bool(thinking.text().strip()))
+        self._chat_scroll_bottom()
+
+    def _has_md_markup(self, text):
+        """判断文本里有没有需要渲染的 markdown 迹象（v6.75）
+
+        旧逻辑只认代码块与表格 → 标题/加粗/列表在流式路径下会显示成原始 .md。
+        这里把常见的行内/块级 markdown 都算上；纯文本（无标记）仍走快路径不重渲染。
+        """
+        s = str(text or '')
+        if not s.strip():
+            return False
+        if '```' in s or self._looks_like_table(s):
+            return True
+        import re as _re
+        pats = (r'\*\*[^*\n]+\*\*',      # **加粗**
+                r'(?m)^\s{0,3}#{1,6}\s+\S',  # # 标题
+                r'(?m)^\s{0,3}[-*+]\s+\S',   # - 列表
+                r'(?m)^\s{0,3}\d+[.)]\s+\S',  # 1. 列表
+                r'(?m)^\s{0,3}>\s+\S',        # > 引用
+                r'`[^`\n]+`',             # `行内代码`
+                r'\[[^\]\n]+\]\([^)\n]+\)')  # [链接](url)
+        return any(_re.search(p, s) for p in pats)
+
+    def _display_ai_reply(self, reply):
+        """主线程槽：显示 AI 回复（解析情绪标签切换立绘）"""
+        # v6.42 fix：任何回复路径先清状态行（工具轮耗尽/超时后的非流式回复会残留 ⏳）
+        try:
+            self._remove_status_line()
+        except Exception as _exc:
+            _silent_log('_display_ai_reply:2480', _exc)   # v6.54
+        if getattr(self, '_stream_rendered', False) and reply:
+            # v6.40 流式已渲染正文：只记录历史 + 情绪切换，不重复打字机
+            self._stream_rendered = False
+            import datetime as _dt
+            ts = _dt.datetime.now().strftime('%m-%d %H:%M')
+            _display, emotion = self._strip_emotion_tag(reply)
+            self.display_msgs.append({'who': '桌宠', 'text': str(_display), 'ts': ts})  # v6.40 fix：历史存剥标签后的正文
+            if len(self.display_msgs) > 300:
+                self.display_msgs = self.display_msgs[-300:]
+            self._apply_emotion(emotion)
+            self._save_chat_memory()  # v6.40 fix：流式路径此前跳过保存，对话历史不落盘
+            try:
+                self._attach_bubble_actions(self._chat_type_bubble, _display)  # v6.40 fix：复制按钮存剥标签后的正文（原始reply含[emotion:xxx]）
+            except Exception as _exc:
+                _silent_log('_display_ai_reply:2495', _exc)   # v6.54
+            # v6.40+ 富文本恢复：含 markdown（**加粗** / 标题 / 列表 / 引用 / 链接 / 代码 / 表格）
+            #   → 同气泡重渲染成富文本（复制按钮回归）
+            # ★ v6.75 fix：旧条件只认 ``` 和表格 ✗ → 标题/加粗/列表这类普通 markdown
+            #   在流式路径下永远是“原始 .md”（使用者的“有时不渲染”就是这个：
+            #   取决于内容里有没有代码块/表格，他出选项那次内容恰好都是普通 markdown）
+            #   新版：只要看出 markdown 迹象就重渲染。
+            if self._has_md_markup(_display):
+                try:
+                    self._rerender_rich(_display)
+                except Exception as _exc:
+                    _silent_log('_display_ai_reply:2501', _exc)   # v6.54
+            # v6.41 fix：流式路径也渲染情感选项（AI 正文 + offer_choices 工具调用时）
+            if getattr(self, '_choices_requested', False):
+                self._choices_requested = False
+                try:
+                    self._render_choices()
+                except Exception as _exc:
+                    _silent_log('_display_ai_reply:2508', _exc)   # v6.54
+            return
+        if not reply and getattr(self, '_choices_requested', False):
+            self._choices_requested = False
+            self._render_choices()
+            return
+        display, emotion = self._strip_emotion_tag(reply)
+        if emotion:
+            self._apply_emotion(emotion)
+        # AI 回复流式显示到聊天框（打字机效果），不弹气泡避免挡脸
+        self._chat_type_start(display)
+        self._play_sound('msg')
+        self._save_chat_memory()
+
+    # ---------- 聊天面板打字机（v6.15 流式显示，按 Markdown 块渲染） ----------
+    @staticmethod
+    def _split_md_blocks(text):
+        """把 markdown 拆成渲染块（拆至 chat_render.split_md_blocks）
+        （实现已搬至 pet_bubble.split_typewriter_blocks）"""
+        return pb.split_typewriter_blocks(text)
+    def _chat_type_start(self, text):
+        """开始流式显示：拆块预渲染，逐块插入（回复到达时先清掉残留状态行）"""
+        text = self._strip_emotion_tags(str(text))[0]  # v6.40 出口统一剥 emotion 标签
+        self.chat_type_blocks = self._split_rich_blocks(text)  # (类型, 内容) 元组列表
+        self.chat_type_index = 0
+        # 记录显示历史（AI 回复全文，与面板显示同步——打字机只是动画，历史立即入栈）
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime('%m-%d %H:%M')
+        self.display_msgs.append({'who': '桌宠', 'text': str(text), 'ts': ts})
+        if len(self.display_msgs) > 300:
+            self.display_msgs = self.display_msgs[-300:]
+        # 回复到达：自动检查代码块语法（v6.17），并清除残留状态行
+        self._code_check_warning = self._check_code_blocks(text)
+        self._remove_status_line()
+        # 创建气泡骨架（头部 + 空内容区，逐块填充；v6.19b 传 text 使 AI 消息也有复制/存图按钮）
+        self._chat_type_bubble, self._chat_type_content = self._new_bubble('桌宠', ts, is_user=False, text=str(text))
+        self._chat_scroll_bottom()
+        self._maybe_cloud_hint(text)   # v6.77：面板折叠/隐藏时用云朵提示这条回复
+        if not self.chat_type_blocks:
+            return
+        self.chat_type_timer.start(30)
+
+    def _chat_type_tick(self):
+        """打字机 tick：渲染一块（文本段落/代码卡片/表格卡片）"""
+        if self.chat_type_index >= len(self.chat_type_blocks):
+            self.chat_type_timer.stop()
+            return
+        kind, content = self.chat_type_blocks[self.chat_type_index]
+        self._render_one_block(self._chat_type_content, kind, content)
+        self.chat_type_index += 1
+        self._chat_scroll_bottom()
+        if self.chat_type_index >= len(self.chat_type_blocks):
+            self.chat_type_timer.stop()
+            # v6.30 打字机完成：追加待展示的选项按钮（同气泡）
+            if getattr(self, '_pending_choices', None):
+                self._render_choices()
+            self._maybe_append_code_warning()
+
+    def _chat_type_finish(self):
+        """立即完成剩余块（新消息到达时 fast-forward）"""
+        if not self.chat_type_timer.isActive():
+            return
+        self.chat_type_timer.stop()
+        while self.chat_type_index < len(getattr(self, 'chat_type_blocks', [])):
+            self._chat_type_tick()
+
+    # ---------- 对话记忆（按角色隔离，v6.16） ----------
+    def _chat_memory_path(self):
+        """每个角色独立的对话历史文件"""
+        return os.path.join(BASE_DIR, f'chat_memory_{self.current}.json')
+
+    def _load_chat_memory(self):
+        """从文件加载当前角色的历史对话（LLM 上下文 + 显示历史分离）——只加载数据，回显由 _echo_display_history 在面板创建后执行"""
+        mem_path = self._chat_memory_path()
+        try:
+            if os.path.exists(mem_path):
+                with open(mem_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self.chat_history_msgs = data.get('messages', [])
+                self.display_msgs = data.get('display', [])[-300:]
+                # v6.40：净化历史数据中残留的 emotion 控制标签（旧版保存过含标签的显示历史）
+                import re as _re
+                for _m in self.display_msgs:
+                    if isinstance(_m, dict) and _m.get('text'):
+                        _m['text'] = _re.sub(r'\[emotion:[^\]]*\]', '', str(_m['text']))
+        except Exception as _exc:
+            _silent_log('_load_chat_memory:2593', _exc)   # v6.54
+
+    def _echo_display_history(self):
+        """回显最近 30 条显示历史到面板（在聊天历史区创建后调用）"""
+        shown = self.display_msgs[-30:]
+        for m in shown:
+            ts = m.get('ts', '')
+            who = m.get('who', '桌宠')
+            bubble, content = self._new_bubble(who, ts, is_user=(who == '我'), text=str(m.get('text', '')))
+            self._render_md_into(content, str(m.get('text', '')))
+        self._display_offset = max(0, len(self.display_msgs) - len(shown))
+        self._update_more_button()
+        if not shown:
+            self._show_empty_hint()
+
+    # ---------- v6.81：空对话占位提示 ----------
+    def _show_empty_hint(self, text=None):
+        """没有消息时给一句占位提示（不然清空后那块区域一片空白，像是坏了）"""
+        try:
+            if not hasattr(self, 'chat_history_layout'):
+                return
+            if self.chat_history_layout.count() > 1:
+                self._hide_empty_hint()   # 已经有消息了，提示不该在场
+                return
+            hint = getattr(self, 'chat_empty_hint_lbl', None)
+            if hint is None:
+                hint = QLabel(self.chat_history_container)
+                hint.setAlignment(Qt.AlignCenter)
+                hint.setWordWrap(True)
+                hint.setObjectName('chatEmptyHint')
+                self.chat_empty_hint_lbl = hint
+            hint.setText(text or self._t('chat_empty_hint'))
+            self._set_themed_qss(hint, lambda: (
+                'QLabel{color:%s;font-size:11px;background:transparent;padding:10px;}'
+                % self._tk('ui_text_dim')))
+            if self.chat_history_layout.indexOf(hint) < 0:
+                self.chat_history_layout.insertWidget(0, hint)
+            hint.show()
+        except Exception as _exc:
+            _silent_log('_show_empty_hint:3342', _exc)
+
+    def _hide_empty_hint(self):
+        """有消息了就把占位提示摘掉（控件留着复用，不销毁）"""
+        hint = getattr(self, 'chat_empty_hint_lbl', None)
+        if hint is None:
+            return
+        try:
+            self.chat_history_layout.removeWidget(hint)
+            hint.hide()
+        except Exception as _exc:
+            _silent_log('_hide_empty_hint:3352', _exc)
+
+    def _save_chat_memory(self):
+        """保存当前角色的对话历史到文件（LLM 上下文 + 显示历史）"""
+        mem_path = self._chat_memory_path()
+        try:
+            # 只保留最近 50 条 LLM 上下文 + 最近 300 条显示历史
+            msgs = self.chat_history_msgs[-50:]
+            self._atomic_write_json(mem_path, {'messages': msgs, 'display': self.display_msgs[-300:]})
+        except Exception as _exc:
+            _silent_log('_save_chat_memory:2614', _exc)   # v6.54
+
+    def _clear_chat_memory(self):
+        self.chat_history_msgs = []
+        self.display_msgs = []
+        self._display_offset = 0
+        self._save_chat_memory()
+        self._clear_chat_history()
+        self._update_more_button()
+        self._show_empty_hint()
+
+    def _select_msgs_dialog(self):
+        """导出前选择要导出的聊天消息（可视化勾选）——返回选中的 display_msgs 子集；取消返回 None"""
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+                                       QPushButton, QHeaderView, QCheckBox, QWidget, QAbstractItemView)
+        msgs = self.display_msgs
+        if not msgs:
+            self._notify('没有可导出的聊天记录')
+            return None
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        T = self._t
+        dlg = QDialog(self)
+        dlg.setWindowTitle(T('export_chat'))
+        pwin.add_hide_button(dlg)       # v6.90：标题栏「—」隐藏键
+        dlg.resize(640, 460)
+        lay = QVBoxLayout(dlg)
+
+        table = QTableWidget(len(msgs), 4)
+        table.setHorizontalHeaderLabels(['✓', T('mem_time'), T('mem_who'), T('mem_content')])
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        table.setColumnWidth(0, 40)
+        table.setColumnWidth(1, 100)
+        table.setColumnWidth(2, 60)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        checks = []
+        for i, m in enumerate(msgs):
+            cb = QCheckBox()
+            cb.setChecked(True)
+            w = QWidget()
+            from PySide6.QtWidgets import QHBoxLayout as _HL
+            hl = _HL(w)
+            hl.addWidget(cb)
+            hl.setAlignment(Qt.AlignCenter)
+            hl.setContentsMargins(0, 0, 0, 0)
+            table.setCellWidget(i, 0, w)
+            checks.append(cb)
+            table.setItem(i, 1, QTableWidgetItem(m.get('ts', '')))
+            table.setItem(i, 2, QTableWidgetItem(m.get('who', '桌宠')))
+            text = str(m.get('text', '')).replace('\n', ' ')
+            table.setItem(i, 3, QTableWidgetItem(text[:60] + ('…' if len(text) > 60 else '')))
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        lay.addWidget(table, 1)
+
+        def set_all(v):
+            for c in checks:
+                c.setChecked(v)
+
+        def set_who(who):
+            for i, m in enumerate(msgs):
+                checks[i].setChecked(m.get('who') == who)
+
+        top = QHBoxLayout()
+        b_all = QPushButton(T('mem_select_all'))
+        b_all.clicked.connect(lambda: set_all(True))
+        b_none = QPushButton(T('mem_select_none'))
+        b_none.clicked.connect(lambda: set_all(False))
+        b_me = QPushButton(T('mem_select_me'))
+        b_me.clicked.connect(lambda: set_who('我'))
+        b_pet = QPushButton(T('mem_select_pet'))
+        b_pet.clicked.connect(lambda: set_who('桌宠'))
+        for b in (b_all, b_none, b_me, b_pet):
+            top.addWidget(b)
+        top.addStretch(1)
+        lay.addLayout(top)
+
+        bottom = QHBoxLayout()
+        label = QTableWidgetItem if False else None
+        b_ok = QPushButton(T('mem_export'))
+        b_cancel = QPushButton('✕')
+        bottom.addStretch(1)
+        bottom.addWidget(b_ok)
+        bottom.addWidget(b_cancel)
+        lay.addLayout(bottom)
+
+        def update_count():
+            """按钮显示选中条数；0 条时禁用"""
+            sel = sum(1 for c in checks if c.isChecked())
+            b_ok.setText(T('mem_export') + f' ({sel})')
+            b_ok.setEnabled(sel > 0)
+
+        for c in checks:
+            c.toggled.connect(update_count)
+        update_count()
+
+        result = {'selected': None}
+
+        def on_ok():
+            result['selected'] = [m for m, c in zip(msgs, checks) if c.isChecked()]
+            dlg.accept()
+
+        b_ok.clicked.connect(on_ok)
+        b_cancel.clicked.connect(dlg.reject)
+        dlg.exec()
+        return result['selected']
+
+    def _export_chat(self):
+        """导出聊天记录——先可视化勾选要导出的消息，再选保存位置（默认 聊天记录/ 文件夹）"""
+        try:
+            import datetime as _dt
+            from PySide6.QtWidgets import QFileDialog
+            msgs = self._select_msgs_dialog()
+            if msgs is None:
+                return  # 用户取消选择
+            if not msgs:
+                self._notify('未选择任何消息')
+                return
+            # 默认导出目录：BASE_DIR/聊天记录/（不存在则创建）
+            export_dir = os.path.join(BASE_DIR, '聊天记录')
+            os.makedirs(export_dir, exist_ok=True)
+            default_name = f'聊天记录_{_dt.datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
+            default_path = os.path.join(export_dir, default_name)
+            path, _ = QFileDialog.getSaveFileName(
+                self, '导出聊天记录', default_path, '文本文件 (*.txt)')
+            if not path:
+                return  # 用户取消保存
+            # v6.53：改为原子写（先写临时文件再替换，防导出中途失败留下半截文件）
+            import re as _rex
+            _buf = [f'DeepSeek 桌宠聊天记录（导出时间 {_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}，共 {len(msgs)} 条）\n',
+                    '=' * 40 + '\n']
+            for m in msgs:
+                who = m.get('who', '桌宠')
+                c = (m.get('text') or '').strip()
+                ts = m.get('ts', '')
+                if c:
+                    c = _rex.sub(r'\[emotion:[a-z_]+\]?\s*', '', c)
+                    _buf.append(f'[{ts}] {who}: {c}\n')
+            _atomic_write_text(path, ''.join(_buf))
+            self._notify(f'📤 已导出 {len(msgs)} 条：{path}')
+        except Exception as e:
+            self._notify(f'导出失败：{e}')
+
+    def _scan_live2d_models(self):
+        """扫描 assets/live2d/ 下所有含 model3.json 的模型目录，返回 {目录名: 路径}"""
+        result = {}
+        root = os.path.join(BASE_DIR, 'assets', 'live2d')
+        if os.path.isdir(root):
+            for d in os.listdir(root):
+                sub = os.path.join(root, d)
+                if os.path.isdir(sub):
+                    for f in os.listdir(sub):
+                        if f.endswith('.model3.json'):
+                            result[d] = os.path.join(sub, f)
+                            break
+        return result
+
+    def _live2d_model_path(self):
+        """当前配置的 Live2D 模型路径（不存在则回退第一个可用）"""
+        models = self._scan_live2d_models()
+        name = getattr(self, 'live2d_model', 'mao')
+        if name in models:
+            return models[name]
+        if models:
+            self.live2d_model = next(iter(models))
+            return models[self.live2d_model]
+        return None
+
+    def _create_l2d_embedded(self):
+        """创建内嵌 Live2D 显示部件（透明 GL，替代静态立绘区域）"""
+        model_path = self._live2d_model_path()
+        if model_path is None or not os.path.exists(model_path):
+            return None
+        try:
+            import live2d.v3 as live2d
+            from PySide6.QtOpenGLWidgets import QOpenGLWidget
+        except Exception:
+            return None
+        if not getattr(self, '_l2d_inited', False):
+            try:
+                live2d.init()
+                self._l2d_inited = True
+            except Exception:
+                return None
+
+        class L2DPet(QOpenGLWidget):
+            def __init__(self, pet, parent=None):
+                super().__init__(parent)
+                self.pet = pet
+                self.model = None
+                self.t = 0
+                self._look = None
+                self._gl_ready = False
+                self.setMouseTracking(True)
+
+            def initializeGL(self):
+                try:
+                    live2d.glInit()
+                    self.model = live2d.LAppModel()
+                    self.model.LoadModelJson(model_path)
+                    self.model.Resize(max(1, self.width()), max(1, self.height()))
+                    self.model.SetAutoBlinkEnable(True)
+                    self.model.SetAutoBreathEnable(True)
+                    self.model.StartRandomMotion('Idle', 1)
+                    self._gl_ready = True
+                    # 动画驱动 30fps
+                    from PySide6.QtCore import QTimer as _QT
+                    self.drive_timer = _QT(self)
+                    self.drive_timer.timeout.connect(self._drive)
+                    self.drive_timer.start(33)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+
+            def _drive(self):
+                if self.model is None or not self._gl_ready:
+                    return
+                import math
+                self.t += 0.033
+                try:
+                    if self._look:
+                        nx, ny = self._look
+                        self.model.SetParameterValue('ParamEyeBallX', nx * 1.0)
+                        self.model.SetParameterValue('ParamEyeBallY', ny * 0.8)
+                        self.model.SetParameterValue('ParamAngleZ', nx * 12.0)
+                        self.model.SetParameterValue('ParamAngleX', ny * 10.0)
+                    else:
+                        self.model.SetParameterValue('ParamAngleZ', math.sin(self.t * 1.2) * 8.0)
+                        self.model.SetParameterValue('ParamAngleX', math.sin(self.t * 0.8) * 4.0)
+                    self.model.SetParameterValue('ParamBodyAngleZ', math.sin(self.t * 0.6) * 4.0)
+                    blink = max(0.0, math.sin(self.t * math.pi / 3.0))
+                    self.model.SetParameterValue('ParamEyeLOpen', blink)
+                    self.model.SetParameterValue('ParamEyeROpen', blink)
+                    self.model.SetParameterValue('ParamBreath', math.sin(self.t * 1.5) * 0.5 + 0.5)
+                    self.update()
+                except Exception as _exc:
+                    _silent_log('_drive:2847', _exc)   # v6.54
+
+            def paintGL(self):
+                live2d.clearBuffer(0, 0, 0, 0)
+                if self.model and self._gl_ready:
+                    self.model.Update()
+                    self.model.Draw()
+
+            def resizeGL(self, w, h):
+                if self.model:
+                    self.model.Resize(max(1, w), max(1, h))
+
+            def mousePressEvent(self, e):
+                self.pet.mousePressEvent(e)
+
+            def mouseReleaseEvent(self, e):
+                self.pet.mouseReleaseEvent(e)
+                if self.model and not self.pet.dragging:
+                    self.model.StartRandomMotion('TapBody', 2)
+
+            def mouseDoubleClickEvent(self, e):
+                self.pet.mouseDoubleClickEvent(e)
+
+            def mouseMoveEvent(self, e):
+                self._look = ((e.position().x() / max(1, self.width()) - 0.5) * 2,
+                              (e.position().y() / max(1, self.height()) - 0.5) * 2)
+                if self.pet.dragging and (e.buttons() & Qt.LeftButton):
+                    self.pet.move(e.globalPosition().toPoint() - self.pet.drag_offset)
+
+            def leaveEvent(self, e):
+                self._look = None
+
+        w = L2DPet(self)
+        w.setMinimumSize(200, 300)
+        return w
+
+    def _set_live2d_model(self, name):
+        """切换 Live2D 模型（重建显示部件）"""
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        models = self._scan_live2d_models()
+        if name not in models:
+            self._notify('模型不存在' if not is_en else 'Model not found')
+            return
+        self.live2d_model = name
+        self._save_cfg_value('live2d_model', name)
+        if getattr(self, 'display_mode', 'static') == 'live2d':
+            # 销毁旧部件重建
+            old = getattr(self, '_l2d_widget', None)
+            if old is not None:
+                self.pet_stack.removeWidget(old)
+                old.deleteLater()
+                self._l2d_widget = None
+            w = self._create_l2d_embedded()
+            if w is not None:
+                self.pet_stack.addWidget(w)
+                self._l2d_widget = w
+                self.pet_stack.setCurrentWidget(w)
+                self.bubble.raise_()
+        self._notify(f'🤖 已切换 Live2D 模型：{name}' if not is_en else f'🤖 Switched Live2D model: {name}')
+
+    def _set_display_mode(self, mode):
+        """切换显示模式：static 静态立绘 / live2d 模型"""
+        if mode not in ('static', 'live2d'):
+            return
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        if mode == 'live2d':
+            if not hasattr(self, '_l2d_widget') or self._l2d_widget is None:
+                w = self._create_l2d_embedded()
+                if w is None:
+                    self._notify('Live2D 不可用（缺少 live2d-py 或模型文件）' if not is_en else 'Live2D unavailable (missing live2d-py or model)')
+                    return
+                self.pet_stack.addWidget(w)
+                self._l2d_widget = w
+            self.display_mode = 'live2d'
+            self.pet_stack.setCurrentWidget(self._l2d_widget)
+            self.bubble.raise_()
+            self._save_cfg_value('display_mode', 'live2d')
+            self._notify('🎬 已切换到 Live2D 模式（右键可切回静态立绘）' if not is_en else '🎬 Switched to Live2D mode')
+        else:
+            self.display_mode = 'static'
+            self.pet_stack.setCurrentWidget(self.pet_label)
+            self._save_cfg_value('display_mode', 'static')
+            self._notify('🖼️ 已切换回静态立绘模式' if not is_en else '🖼️ Switched to static art mode')
+
+    def _open_live2d_preview(self):
+        """Live2D 预览窗口（Mao 模型：自动眨眼/呼吸/跟随光标），与静态立绘并行"""
+        if getattr(self, '_l2d_win', None) is not None:
+            try:
+                self._l2d_win.show()
+                self._l2d_win.raise_()
+                return
+            except Exception:
+                self._l2d_win = None
+        if not os.path.exists(LIVE2D_MODEL):
+            self._notify('Live2D 模型不存在（assets/live2d/mao/），无法预览')
+            return
+        try:
+            import live2d.v3 as live2d
+            from PySide6.QtWidgets import QMainWindow
+            from PySide6.QtOpenGLWidgets import QOpenGLWidget
+        except Exception as e:
+            self._notify(f'Live2D 依赖缺失：{e}（需要 pip install live2d-py）')
+            return
+        if not getattr(self, '_l2d_inited', False):
+            try:
+                live2d.init()
+                self._l2d_inited = True
+            except Exception as e:
+                self._notify(f'Live2D 初始化失败：{e}')
+                return
+
+        class L2DWidget(QOpenGLWidget):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.model = None
+                self.t = 0
+                self.ids = []
+                self._look = None  # 视线跟随目标 (nx, ny)，None=无鼠标
+                self.setMouseTracking(True)  # 关键：不按鼠标也触发 mouseMoveEvent（视线跟随）
+
+            def initializeGL(self):
+                try:
+                    live2d.glInit()
+                    self.model = live2d.LAppModel()
+                    self.model.LoadModelJson(LIVE2D_MODEL)
+                    self.model.Resize(self.width(), self.height())
+                    self.ids = self.model.GetParamIds()
+                    self.model.SetAutoBlinkEnable(True)
+                    self.model.SetAutoBreathEnable(True)
+                    self.model.StartRandomMotion('Idle', 1)
+                    # 手动动画驱动 30fps：头部摆动/眨眼/呼吸，确保明显可见
+                    self.anim_timer = QTimer(self)
+                    self.anim_timer.timeout.connect(self._drive)
+                    self.anim_timer.start(33)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+
+            def _drive(self):
+                """每帧驱动：视线跟随（有鼠标）或自动摆动（无鼠标）+ 眨眼呼吸"""
+                if self.model is None:
+                    return
+                import math
+                self.t += 0.033
+                try:
+                    if self._look:
+                        # 鼠标在窗口内：头部+眼球跟随光标（满幅度）
+                        nx, ny = self._look
+                        self.model.SetParameterValue('ParamEyeBallX', nx * 1.0)
+                        self.model.SetParameterValue('ParamEyeBallY', ny * 0.8)
+                        self.model.SetParameterValue('ParamAngleZ', nx * 12.0)
+                        self.model.SetParameterValue('ParamAngleX', ny * 10.0)
+                    else:
+                        # 无鼠标：自动缓慢摆动
+                        self.model.SetParameterValue('ParamEyeBallX', 0.0)
+                        self.model.SetParameterValue('ParamEyeBallY', 0.0)
+                        self.model.SetParameterValue('ParamAngleZ', math.sin(self.t * 1.2) * 8.0)
+                        self.model.SetParameterValue('ParamAngleX', math.sin(self.t * 0.8) * 4.0)
+                    self.model.SetParameterValue('ParamBodyAngleZ', math.sin(self.t * 0.6) * 4.0)
+                    blink = max(0.0, math.sin(self.t * math.pi / 3.0))
+                    self.model.SetParameterValue('ParamEyeLOpen', blink)
+                    self.model.SetParameterValue('ParamEyeROpen', blink)
+                    self.model.SetParameterValue('ParamBreath', math.sin(self.t * 1.5) * 0.5 + 0.5)
+                    self.update()  # 关键：每帧请求重绘，否则画面不刷新
+                except Exception as _exc:
+                    _silent_log('_drive:3012', _exc)   # v6.54
+
+            def paintGL(self):
+                try:
+                    live2d.clearBuffer(0, 0, 0, 0)
+                    if self.model:
+                        self.model.Update()
+                        self.model.Draw()
+                except Exception:
+                    pass
+
+            def resizeGL(self, w, h):
+                if self.model:
+                    self.model.Resize(w, h)
+
+            def mouseMoveEvent(self, e):
+                if self.model:
+                    # 归一化到 -1~1（相对窗口中心），供参数驱动
+                    self._look = (
+                        (e.position().x() / max(1, self.width()) - 0.5) * 2,
+                        (e.position().y() / max(1, self.height()) - 0.5) * 2,
+                    )
+                    self.update()
+
+            def leaveEvent(self, e):
+                self._look = None
+
+            def mousePressEvent(self, e):
+                if self.model:
+                    self.model.StartRandomMotion('TapBody', 2)
+
+        win = QMainWindow()
+        win.setWindowTitle('Live2D Preview' if getattr(self, 'language', 'zh') == 'en' else 'Live2D 预览')
+        win.resize(420, 520)
+        win.setCentralWidget(L2DWidget(win))
+        pl.set_topmost(win, True)   # v6.72 批次2
+        win.show()
+        self._l2d_win = win
+
+    # ---------- v6.80：新开对话（旧对话自动存档） ----------
+
+    def _archive_dir(self):
+        """对话存档目录：统一收进 chat_archive/，项目根目录保持干净"""
+        d = os.path.join(BASE_DIR, 'chat_archive')
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as _exc:
+            _silent_log('_archive_dir:3648', _exc)
+            return BASE_DIR
+        return d
+
+    def _archive_chat_file(self):
+        """把当前对话落盘成带时间戳的 txt，返回文件名（没内容返回 ''）
+
+        取 display_msgs（= 面板上看到的，含提醒/系统提示），为空时退回 LLM 上下文。
+        v6.53 的护栏保留：写失败/写空一律抛错，由调用方决定「不清空」。
+        """
+        import datetime as _dt
+        import re as _rex
+        rows = [m for m in (self.display_msgs or []) if str(m.get('text') or '').strip()]
+        if not rows:
+            rows = [{'who': '我' if m.get('role') == 'user' else '桌宠',
+                     'ts': '', 'text': m.get('content') or ''}
+                    for m in (self.chat_history_msgs or [])]
+            rows = [m for m in rows if str(m.get('text') or '').strip()]
+        if not rows:
+            return ''
+        now = _dt.datetime.now()
+        name = (CHARACTERS.get(self.current) or {}).get('name', self.current)
+        fname = '对话存档_%s_%s.txt' % (self.current, now.strftime('%Y%m%d_%H%M%S'))
+        path = os.path.join(self._archive_dir(), fname)
+        buf = ['角色: %s  时间: %s' % (name, now.strftime('%Y-%m-%d %H:%M:%S')), '=' * 40]
+        for m in rows:
+            txt = _rex.sub(r'\[emotion[:=][a-z_]+\]?\s*', '', str(m.get('text') or '')).strip()
+            if not txt:
+                continue
+            ts = ('[%s] ' % m['ts']) if m.get('ts') else ''
+            buf.append('%s%s: %s' % (ts, m.get('who') or '桌宠', txt))
+        _atomic_write_text(path, '\n'.join(buf) + '\n')
+        if not (os.path.exists(path) and os.path.getsize(path) > 0):
+            raise RuntimeError('存档写入校验失败')
+        return fname
+
+    def _new_conversation(self, archive=True):
+        """v6.80：开一段全新对话 —— 旧对话先存档，再清空上下文/回显/待发附件
+
+        为什么需要：上下文攒多了，回答会被旧话题带跑；面板也塞满滚不完的旧消息。
+        存档是自动的（chat_archive/），所以不弹确认框，误点也能把 txt 找回来。
+        """
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        # ① 先停掉在跑的回复与排队任务，否则旧线程会继续往“新对话”里写内容
+        try:
+            if getattr(self, '_task_queue', None):
+                self._task_queue = []
+            if getattr(self, '_ai_busy', False):
+                self._stop_ai()
+            self._pending_resume = False
+        except Exception as _exc:
+            _silent_log('_new_conversation:stop', _exc)
+        # ② 存档：存不下来就别清（宁可不清，也不能丢数据）
+        name = ''
+        if archive:
+            try:
+                name = self._archive_chat_file()
+            except Exception as e:
+                self._notify(('新对话已取消：旧对话存档失败（%s）' if not is_en
+                              else 'New chat cancelled: archive failed (%s)') % e,
+                             ms=self.COST_NOTIFY_MS)
+                return False
+        # ③ 清空上下文 + 回显 + 待发附件 + 输入框
+        self.chat_history_msgs = []
+        self.display_msgs = []
+        self._display_offset = 0
+        self._cur_task_text = None
+        self._pending_attachments = []
+        try:
+            self._refresh_attach_bar()
+        except Exception as _exc:
+            _silent_log('_new_conversation:attach', _exc)
+        try:
+            self.chat_input.clear()
+            self.chat_input.setFixedHeight(34)
+        except Exception as _exc:
+            _silent_log('_new_conversation:input', _exc)
+        self._clear_chat_history()
+        self._save_chat_memory()
+        self._update_more_button()
+        self._show_empty_hint()   # 清空后给一句占位，别留一片空白
+        # ③.5 v6.91：权限回严格 —— 放权只对本轮对话有效，新对话重新开始问
+        try:
+            if self.perm.reset():
+                self._apply_perm_btn()
+        except Exception as _exc:
+            _silent_log('_new_conversation:perm', _exc)
+        # ④ 反馈（状态条，不往新对话里塞系统消息）
+        if name:
+            self._notify(('🌱 已开始新对话（旧对话已存档：chat_archive/%s）' if not is_en
+                          else '🌱 New chat started (archived: chat_archive/%s)') % name,
+                         ms=self.COST_NOTIFY_MS)
+        else:
+            self._notify('🌱 已开始新对话' if not is_en else '🌱 New chat started',
+                         ms=self.COST_NOTIFY_MS)
+        return True
+
+    def _archive_and_clear(self):
+        """存档并清空（旧入口，保留兼容）→ 现在统一走 _new_conversation"""
+        return self._new_conversation(archive=True)
+
+    def _open_memory_manager(self):
+        """记忆管理窗口：表格视图，支持筛选/搜索/编辑/删除/添加"""
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+                                       QPushButton, QComboBox, QLineEdit, QHeaderView, QInputDialog, QMessageBox)
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        T = self._t
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(T('memory_menu'))
+        pwin.add_hide_button(dlg)       # v6.90：标题栏「—」隐藏键
+        dlg.resize(600, 440)
+        lay = QVBoxLayout(dlg)
+
+        # 顶部：角色筛选 + 搜索
+        top = QHBoxLayout()
+        role_box = QComboBox()
+        role_box.addItem(T('mem_all'), '')
+        role_box.addItem('⚡ Flash', 'flash')
+        role_box.addItem('🐋 Pro', 'pro')
+        top.addWidget(role_box)
+        search_edit = QLineEdit()
+        search_edit.setPlaceholderText(T('mem_search'))
+        top.addWidget(search_edit, 1)
+        lay.addLayout(top)
+
+        # 表格
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels([T('mem_imp'), T('mem_content'), T('mem_role'), T('mem_time'), ''])
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.setColumnWidth(0, 70)
+        table.setColumnWidth(2, 70)
+        table.setColumnWidth(3, 110)
+        table.setColumnWidth(4, 60)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        lay.addWidget(table, 1)
+
+        def refresh():
+            """刷新表格（按筛选+搜索）"""
+            rfilter = role_box.currentData()
+            kw = search_edit.text().strip().lower()
+            active = [f for f in self.memory_facts if f.get('status') == 'active']
+            if rfilter:
+                active = [f for f in active if f.get('roles', 'both') in (rfilter, 'both')]
+            if kw:
+                active = [f for f in active if kw in (f.get('content') or '').lower()]
+            active.sort(key=lambda x: -x.get('importance', 3))
+            self._mem_current_ids = [f.get('id') for f in active]
+            table.setRowCount(0)
+            for f in active:
+                r = table.rowCount()
+                table.insertRow(r)
+                table.setItem(r, 0, QTableWidgetItem('★' * f.get('importance', 3)))
+                table.setItem(r, 1, QTableWidgetItem(f.get('content', '')))
+                roles = f.get('roles', 'both')
+                table.setItem(r, 2, QTableWidgetItem({'flash': 'Flash', 'pro': 'Pro', 'both': 'Both'}.get(roles, 'Both')))
+                table.setItem(r, 3, QTableWidgetItem(f.get('created_at', '')[:16]))
+                del_btn = QPushButton(T('mem_edit'))
+                del_btn.setFixedWidth(52)
+                del_btn.clicked.connect(lambda checked, fid=f.get('id', ''): _edit_row(fid, table.currentRow()))
+                table.setCellWidget(r, 4, del_btn)
+
+        def _edit_row(fid, row):
+            """编辑单条记忆（内容+重要度）"""
+            f = next((x for x in self.memory_facts if x.get('id') == fid), None)
+            if not f:
+                return
+            new_text, ok1 = QInputDialog.getText(dlg, T('mem_edit'), T('mem_content'), text=f.get('content', ''))
+            if ok1 and new_text.strip():
+                imp, ok2 = QInputDialog.getInt(dlg, T('mem_edit'), T('mem_imp'), f.get('importance', 3), 1, 5)
+                if ok2:
+                    f['content'] = new_text.strip()
+                    f['importance'] = imp
+                    f['updated_at'] = __import__('datetime').datetime.now().isoformat(timespec='seconds')
+                    self._save_memory()
+                    refresh()
+
+        def on_double(row, col):
+            item = table.item(row, 1)
+            if item:
+                fid = self._memory_fid_by_row(row)
+                if fid:
+                    _edit_row(fid, row)
+
+        def add_memory():
+            text, ok = QInputDialog.getText(dlg, T('mem_add'), T('mem_content'))
+            if ok and text.strip():
+                imp, ok2 = QInputDialog.getInt(dlg, T('mem_add'), T('mem_imp'), 3, 1, 5)
+                if ok2:
+                    self._remember_fact('add', text.strip(), imp)
+                    refresh()
+
+        def delete_selected():
+            rows = sorted({i.row() for i in table.selectedIndexes()}, reverse=True)
+            if not rows:
+                return
+            for r in rows:
+                fid = self._memory_fid_by_row(r)
+                if fid:
+                    self._remember_fact('delete', fid=fid)
+            refresh()
+
+        # 底部按钮
+        bottom = QHBoxLayout()
+        btn_add = QPushButton(T('mem_add'))
+        btn_add.clicked.connect(add_memory)
+        btn_del = QPushButton(T('mem_delete'))
+        btn_del.clicked.connect(delete_selected)
+        btn_clear = QPushButton(T('clear_memory'))
+        btn_clear.clicked.connect(self._clear_memory_confirm)
+        btn_close = QPushButton('✕')
+        btn_close.clicked.connect(dlg.close)
+        bottom.addWidget(btn_add)
+        bottom.addWidget(btn_del)
+        bottom.addWidget(btn_clear)
+        bottom.addStretch(1)
+        bottom.addWidget(btn_close)
+        lay.addLayout(bottom)
+
+        role_box.currentIndexChanged.connect(refresh)
+        search_edit.textChanged.connect(refresh)
+        table.cellDoubleClicked.connect(on_double)
+        self._mem_current_ids = []
+        refresh()
+        dlg.exec()
+
+    def _memory_fid_by_row(self, row):
+        """辅助：按表格行号取当前筛选列表中的记忆 id"""
+        ids = getattr(self, '_mem_current_ids', [])
+        if 0 <= row < len(ids):
+            return ids[row]
+        return None
+
+    # ---------- 定时提醒 ----------
+    def _reminders_path(self):
+        """提醒持久化文件（关机后重启不丢失）"""
+        return os.path.join(BASE_DIR, 'reminders.json')
+
+    def _save_reminders(self):
+        try:
+            self._atomic_write_json(self._reminders_path(), self.reminders)
+        except Exception:
+            pass
+
+    def _load_reminders(self):
+        """加载持久化提醒：关机期间已到期的 → 补发到聊天面板（用户能看到）；未到期 → 继续计时"""
+        try:
+            if os.path.exists(self._reminders_path()):
+                with open(self._reminders_path(), 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                now = time.time()
+                missed = [r for r in data if now >= r.get('time', 0)]
+                pending = [r for r in data if now < r.get('time', 0)]
+                self.reminders = pending
+                self._save_reminders()   # 关键：补发过的从文件移除，防重启/重开重复补发
+                for r in missed:
+                    self._deliver_missed_reminder(r)
+        except Exception:
+            pass
+
+    def _deliver_missed_reminder(self, r):
+        """补发关机期间错过的提醒到聊天面板"""
+        import datetime as _dt
+        due = _dt.datetime.fromtimestamp(r.get('time', 0)).strftime('%m-%d %H:%M')
+        text = r.get('text', '')
+        if r.get('type') == 'followup':
+            # v6.60 批 3：改走关心气泡（不再重复写聊天列表）
+            self.say_care('早安呀，昨晚休息得怎么样？记得吃早餐哦', kind='greet')
+        else:
+            self.say_care(f'⏰ 补发提醒（原定 {due}，关机期间错过）：{text}', kind='remind')
+            self._play_sound('remind')
+
+    def _check_reminders(self):
+        """每秒检查提醒是否到期（普通提醒=气泡；回访=触发 AI 主动关心）"""
+        now = time.time()
+        due = [r for r in self.reminders if now >= r['time']]
+        if due:
+            self.reminders = [r for r in self.reminders if now < r['time']]
+            self._save_reminders()
+            for r in due:
+                if r.get('type') == 'followup':
+                    self._ai_followup(r['text'])
+                else:
+                    self.say_care(f'⏰ 提醒：{r["text"]}', kind='remind')
+                    self._play_sound('remind')
+
+    def _add_reminder(self, seconds, text, rtype='normal'):
+        self.reminders.append({'time': time.time() + seconds, 'text': text, 'type': rtype})
+        self._save_reminders()
+        if rtype == 'followup':
+            self._notify(f'好，{seconds} 秒后我再来关心你：{text}')
+        else:
+            self.say_plain(f'好，{seconds} 秒后提醒你：{text}')
+            self._notify(f'已设置提醒（{seconds}秒后）：{text}')
+
+    # ---------- 提醒管理窗口（v6.22） ----------
+    def _open_reminder_manager(self):
+        """提醒管理：查看/取消已设提醒"""
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+                                       QPushButton, QHeaderView)
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        T = self._t
+        dlg = QDialog(self)
+        dlg.setWindowTitle(T('reminder_menu'))
+        pwin.add_hide_button(dlg)       # v6.90：标题栏「—」隐藏键
+        dlg.resize(480, 300)
+        lay = QVBoxLayout(dlg)
+
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels([T('rem_left'), T('mem_content'), T('rem_type')])
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.setColumnWidth(0, 90)
+        table.setColumnWidth(2, 80)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        lay.addWidget(table, 1)
+
+        def fmt_left(t):
+            d = t - time.time()
+            if d <= 0:
+                return '0s'
+            h, m, s = int(d // 3600), int(d % 3600 // 60), int(d % 60)
+            if h:
+                return f'{h}h{m}m'
+            if m:
+                return f'{m}m{s}s'
+            return f'{s}s'
+
+        def refresh():
+            table.setRowCount(0)
+            if not self.reminders:
+                return
+            for r in sorted(self.reminders, key=lambda x: x['time']):
+                row = table.rowCount()
+                table.insertRow(row)
+                table.setItem(row, 0, QTableWidgetItem(fmt_left(r['time'])))
+                table.setItem(row, 1, QTableWidgetItem(r['text']))
+                table.setItem(row, 2, QTableWidgetItem(T('rem_followup') if r.get('type') == 'followup' else T('rem_normal')))
+
+        def cancel_selected():
+            rows = sorted({i.row() for i in table.selectedIndexes()}, reverse=True)
+            if not rows:
+                return
+            rems = sorted(self.reminders, key=lambda x: x['time'])
+            for rr in rows:
+                if 0 <= rr < len(rems):
+                    r = rems[rr]
+                    if r in self.reminders:
+                        self.reminders.remove(r)
+            self._save_reminders()
+            refresh()
+
+        def clear_all():
+            if self.reminders:
+                self.reminders.clear()
+                self._save_reminders()
+                refresh()
+
+        bottom = QHBoxLayout()
+        b_cancel = QPushButton(T('rem_cancel'))
+        b_cancel.clicked.connect(cancel_selected)
+        b_clear = QPushButton(T('rem_clear'))
+        b_clear.clicked.connect(clear_all)
+        b_close = QPushButton('✕')
+        b_close.clicked.connect(dlg.close)
+        bottom.addWidget(b_cancel)
+        bottom.addWidget(b_clear)
+        bottom.addStretch(1)
+        bottom.addWidget(b_close)
+        lay.addLayout(bottom)
+        refresh()
+        dlg.exec()
+
+    # ---------- 久坐提醒 + 打盹 + 输入感知（v6.22，零依赖） ----------
+    def _start_idle_system(self):
+        """启动输入感知系统：打盹 / 久坐提醒 / 光标跟随 / 唤醒"""
+        self._last_input_tick = 0
+        self._idle_warned = False
+        self._dozing = False
+        self.idle_timer = QTimer(self)
+        self.idle_timer.timeout.connect(self._check_idle_state)
+        self.idle_timer.start(2000)
+        self.cursor_timer = QTimer(self)
+        self.cursor_timer.timeout.connect(self._cursor_follow)
+        self.cursor_timer.start(100)
+
+    def _get_idle_seconds(self):
+        """系统空闲秒数（GetLastInputInfo，零依赖）
+        （实现已搬至 pet_anim.idle_seconds）"""
+        return anim.idle_seconds()
+    def _check_idle_state(self):
+        """每 2s：打盹切换 / 久坐提醒 / 输入唤醒"""
+        if self.sleeping:
+            return
+        idle = self._get_idle_seconds()
+        if self._edge_side is not None or self._edge_popped or self.dragging:
+            return
+        # 久坐提醒（默认 50 分钟，可配置）
+        limit = getattr(self, 'sedentary_minutes', 50) * 60
+        if idle >= limit and not self._idle_warned:
+            self._idle_warned = True
+            is_en = getattr(self, 'language', 'zh') == 'en'
+            msg = (f'😴 你已经连续坐 {int(idle // 60)} 分钟了，起来活动一下、喝口水吧！' if not is_en
+                   else f'😴 You have been sitting for {int(idle // 60)} minutes. Time to stretch!')
+            self.say_care(msg, kind='remind')
+        elif idle < 60 and self._idle_warned:
+            self._idle_warned = False
+        # 打盹：空闲 3 分钟 → 切换睡眠立绘；有输入 → 唤醒（Live2D 模式跳过，模型自带动画）
+        if getattr(self, 'display_mode', 'static') == 'live2d':
+            return
+        if idle >= 180:
+            if not self._dozing and self.state == 'idle':
+                sleep_img = self._get_state_img('sleep')
+                if sleep_img is not None:
+                    self._dozing = True
+                    self._render_frame(sleep_img)
+        elif self._dozing:
+            self._dozing = False
+            if self.state == 'idle':
+                self._show_idle()
+
+    def _cursor_follow(self):
+        """光标跟随：立绘轻微侧倾（左右 ±4px），仅待机态"""
+        if self.sleeping or self.state != 'idle' or self._edge_side is not None or self._edge_popped or getattr(self, '_dozing', False):
+            return
+        try:
+            center_x = self.geometry().center().x()
+            dx = (QCursor.pos().x() - center_x)
+            dx = max(-400, min(400, dx)) // 100  # -4 ~ 4
+            if dx != getattr(self, '_last_follow_dx', 99):
+                self._last_follow_dx = dx
+                if dx == 0:
+                    if self.state == 'idle':
+                        self._show_idle()
+                else:
+                    self._render_idle_offset(dx)
+        except Exception:
+            pass
+
+    def _render_idle_offset(self, dx):
+        """渲染待机图带水平偏移（光标跟随用）"""
+        src = self.full_idle
+        if src is None or src.isNull():
+            return
+        size = self.pet_size
+        canvas = QPixmap(size, size)
+        canvas.fill(Qt.transparent)
+        p = QPainter(canvas)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        scaled = src.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        p.drawPixmap(int((size - scaled.width()) / 2) + dx, int((size - scaled.height()) / 2), scaled)
+        p.end()
+        self.pet_label.setPixmap(canvas)
+
+    # ---------- 早安日报（v6.22） ----------
+    def _start_morning_report(self):
+        """每天 08:30 早安日报：问候 + 天气 + 提醒概况"""
+        self.morning_timer = QTimer(self)
+        self.morning_timer.timeout.connect(self._morning_report)
+        self._schedule_morning()
+
+    def _schedule_morning(self):
+        now = time.localtime()
+        target = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 8, 30, 0, 0, 0, -1))
+        if target <= time.time():
+            target += 86400
+        self.morning_timer.start(int((target - time.time()) * 1000))
+
+    def _morning_report(self):
+        """生成早安日报（天气异步查询，不卡 UI）"""
+        self._schedule_morning()
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        import datetime as _dt
+        week = ['一', '二', '三', '四', '五', '六', '日'][_dt.datetime.now().weekday()]
+        n_rem = len(self.reminders)
+        if is_en:
+            base = (f'☀️ Good morning! Today is {_dt.datetime.now().strftime("%m/%d")}. '
+                    f'You have {n_rem} reminder(s) set.')
+        else:
+            base = (f'☀️ 早上好！今天是 {_dt.datetime.now().month}月{_dt.datetime.now().day}日 星期{week}。'
+                    f'当前设置了 {n_rem} 条提醒。')
+        self.say_care(base, kind='greet')
+        # 异步查天气（线程 → weather_signal 回主线程）
+        city = self.pet_city
+        def fetch():
+            try:
+                import urllib.request, urllib.parse
+                url = f'https://wttr.in/{urllib.parse.quote(city)}?format=3&lang=zh'
+                req = urllib.request.Request(url, headers={'User-Agent': 'curl/8.0'})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    return resp.read().decode('utf-8').strip()
+            except Exception:
+                return None
+        import threading
+        def worker():
+            r = fetch()
+            if r:
+                self.weather_signal.emit(r)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_weather_result(self, result):
+        """早安日报天气结果（主线程）"""
+        if not result:
+            return
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        wmsg = f'🌤 天气：{self.pet_city} {result}' if not is_en else f'🌤 Weather: {result}'
+        self.say_plain(wmsg)
+        self._append_chat('桌宠', wmsg)
+
+    # ---------- 记忆备份/导入（v6.22） ----------
+    def _export_memory_backup(self):
+        """导出全部记忆为 JSON 备份"""
+        import datetime as _dt
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        try:
+            path = os.path.join(BASE_DIR, f'记忆备份_{_dt.datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+            # v6.53：改为原子写（与 memory.json 落盘同一套机制）
+            _atomic_write_json_impl(path, self.memory_facts)
+            self._notify(f'💾 记忆已备份：{path}' if not is_en else f'💾 Memory backed up: {path}')
+        except Exception as e:
+            self._notify(f'备份失败：{e}' if not is_en else f'Backup failed: {e}')
+
+    def _import_memory_backup(self):
+        """导入记忆备份（JSON，按 id 去重合并）"""
+        from PySide6.QtWidgets import QFileDialog
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        path, _ = QFileDialog.getOpenFileName(self, '选择备份文件' if not is_en else 'Select backup file', BASE_DIR, 'JSON (*.json)')
+        if not path:
+            return
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError('bad format')
+            exist = {f.get('id') for f in self.memory_facts}
+            added = 0
+            for item in data:
+                if isinstance(item, dict) and item.get('id') and item.get('content') and item['id'] not in exist:
+                    item.setdefault('status', 'active')
+                    item.setdefault('importance', 3)
+                    self.memory_facts.append(item)
+                    added += 1
+            self._save_memory()
+            self._notify(f'📥 已导入 {added} 条记忆' if not is_en else f'📥 Imported {added} memories')
+        except Exception as e:
+            self._notify(f'导入失败：{e}' if not is_en else f'Import failed: {e}')
+
+    # ---------- 立绘加载与显示 ----------
+    def load_character(self, key):
+        """加载角色全部立绘（待机/眨眼/扒边/状态/场景）"""
+        self.current = key
+        self.setWindowTitle(CHARACTERS[key]['name'])
+        # 待机整图
+        self.full_idle = QPixmap(asset(key, 'idle')) if os.path.exists(asset(key, 'idle')) else None
+        # 眨眼图（与 idle 同尺寸画布对齐）
+        self.blink_aligned = None
+        blink_p = asset(key, 'blink')
+        if os.path.exists(blink_p) and self.full_idle is not None:
+            b = QPixmap(blink_p)
+            canvas = QPixmap(self.full_idle.size())
+            canvas.fill(Qt.transparent)
+            p = QPainter(canvas)
+            off = BLINK_OFFSETS.get(key, (0, 0))
+            p.drawPixmap(off[0], off[1], b)
+            p.end()
+            self.blink_aligned = canvas
+        # 扒边立绘（左/右竖条 + 上/下横条）+ 闭眼贴边版（睡觉时用）
+        peek_p = asset(key, 'peek')
+        self.peek_pixmap = QPixmap(peek_p) if os.path.exists(peek_p) else None
+        peek_t = asset(key, 'peek_top')
+        self.peek_top_pixmap = QPixmap(peek_t) if os.path.exists(peek_t) else None
+        peek_b = asset(key, 'peek_bottom')
+        self.peek_bottom_pixmap = QPixmap(peek_b) if os.path.exists(peek_b) else None
+        # 闭眼贴边图（睡觉贴边专用；不存在则用完整睡姿兜底）
+        ps = asset(key, 'peek_sleep')
+        self.peek_sleep_pixmap = QPixmap(ps) if os.path.exists(ps) else None
+        pbs = asset(key, 'peek_bottom_sleep')
+        self.peek_bottom_sleep_pixmap = QPixmap(pbs) if os.path.exists(pbs) else None
+        # 状态/场景立绘：懒加载（首次用到才读盘，加速启动）
+        self.state_imgs = {}
+        self.scene_imgs = {}
+        self._scaled_cache = {}  # 缩放结果缓存（id(pixmap) → 已缩放小图）
+        self._restore_display_state()  # 睡觉时显示睡眠立绘，否则待机（切角色不丢睡眠状态）
+
+    def _get_state_img(self, st):
+        """懒加载状态立绘（sleep/happy/thinking 等，首次用到才读盘）"""
+        if st not in self.state_imgs:
+            pth = asset(self.current, st)
+            if os.path.exists(pth):
+                self.state_imgs[st] = QPixmap(pth)
+        return self.state_imgs.get(st)
+
+    def _get_scene_img(self, key):
+        """懒加载场景立绘（吃饭/阅读/音乐等，首次用到才读盘）"""
+        if key not in self.scene_imgs:
+            pth = asset(self.current, key)
+            if os.path.exists(pth):
+                self.scene_imgs[key] = QPixmap(pth)
+        return self.scene_imgs.get(key)
+
+    def _render_frame(self, pixmap=None):
+        """渲染一帧到 pet_label（默认待机图，等比缩放居中；缩放结果缓存复用）"""
+        src = pixmap if pixmap is not None else self.full_idle
+        if src is None or src.isNull():
+            return
+        size = self.pet_size
+        key = (id(src), size)      # v6.81：缓存必须带尺寸（只按 id 缓存 → 改大小后仍画旧尺寸）
+        if key not in self._scaled_cache:
+            self._scaled_cache[key] = src.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = self._scaled_cache[key]
+        canvas = QPixmap(size, size)
+        canvas.fill(Qt.transparent)
+        p = QPainter(canvas)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.drawPixmap(int((size - scaled.width()) / 2), int((size - scaled.height()) / 2), scaled)
+        p.end()
+        self._last_render_src = src    # v6.81：记住这一帧的来源，改大小时原地重画
+        self.pet_label.setPixmap(canvas)
+
+    def _show_idle(self):
+        """待机显示（贴边未弹出 → 扒边立绘；Live2D 模式由模型代替）"""
+        if self.sleeping:
+            return  # 睡眠时不切回待机（防光标跟随/眨眼等 timer 覆盖睡眠立绘）
+        if getattr(self, 'display_mode', 'static') == 'live2d':
+            return
+        if self._edge_side is not None and not self._edge_popped:
+            if self._edge_side in ('left', 'right') and self.peek_pixmap is not None:
+                self._show_peek()
+                return
+            if self._edge_side in ('top', 'bottom'):
+                self._show_peek()
+                return
+        # 恢复正常 pet_label 尺寸
+        if self.pet_label.width() != self.pet_size or self.pet_label.height() != self.pet_size:
+            self.pet_label.setFixedSize(self.pet_size, self.pet_size)
+        self._render_frame(self.full_idle)
+
+    def _restore_display_state(self):
+        """恢复显示状态：睡眠→睡眠立绘，否则→待机（贴边拖出/弹出后用）
+        （实现已搬至 pet_anim.restore_display_state）"""
+        return anim.restore_display_state(self)
+    def _show_peek(self):
+        """扒边立绘（四方向：左右竖条镜像对齐，上下横条；Live2D 模式由模型代替）"""
+        if getattr(self, 'display_mode', 'static') == 'live2d':
+            return
+        size = self.pet_size
+        side = self._edge_side
+        if side in ('left', 'right'):
+            if self.sleeping:
+                # 睡觉贴边：优先用专业闭眼贴边图；无则完整睡姿（左靠左缘，右翻转靠右缘）
+                if self.peek_sleep_pixmap is not None and not self.peek_sleep_pixmap.isNull():
+                    src = self.peek_sleep_pixmap
+                    if side == 'right':
+                        src = src.transformed(QTransform().scale(-1, 1))
+                    canvas = QPixmap(size, size)
+                    canvas.fill(Qt.transparent)
+                    p = QPainter(canvas)
+                    p.setRenderHint(QPainter.SmoothPixmapTransform)
+                    scaled = src.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    draw_x = 0 if side == 'left' else size - scaled.width()
+                    p.drawPixmap(draw_x, int((size - scaled.height()) / 2), scaled)
+                    p.end()
+                    self.pet_label.setPixmap(canvas)
+                    return
+                img = self._get_state_img('sleep')
+                if img is None or img.isNull():
+                    return
+                src = img
+                if side == 'right':
+                    src = src.transformed(QTransform().scale(-1, 1))
+                canvas = QPixmap(size, size)
+                canvas.fill(Qt.transparent)
+                p = QPainter(canvas)
+                p.setRenderHint(QPainter.SmoothPixmapTransform)
+                scaled = src.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                draw_x = 0 if side == 'left' else size - scaled.width()
+                p.drawPixmap(draw_x, int((size - scaled.height()) / 2), scaled)
+                p.end()
+                self.pet_label.setPixmap(canvas)
+                return
+            if self.peek_pixmap is None or self.peek_pixmap.isNull():
+                return
+            src = self.peek_pixmap
+            if side == 'right':
+                src = src.transformed(QTransform().scale(-1, 1))
+            canvas = QPixmap(size, size)
+            canvas.fill(Qt.transparent)
+            p = QPainter(canvas)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            scaled = src.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            draw_x = 0 if side == 'left' else size - scaled.width()
+            p.drawPixmap(draw_x, int((size - scaled.height()) / 2), scaled)
+            p.end()
+            self.pet_label.setPixmap(canvas)
+        else:
+            # 上下：横构图立绘
+            if self.sleeping:
+                # 睡觉贴边：优先用专业闭眼贴边图；无则完整睡姿底部对齐
+                if self.peek_bottom_sleep_pixmap is not None and not self.peek_bottom_sleep_pixmap.isNull():
+                    img = self.peek_bottom_sleep_pixmap
+                else:
+                    img = self._get_state_img('sleep')
+            elif side == 'top':
+                img = self.peek_top_pixmap
+            else:
+                img = self.peek_bottom_pixmap
+            if img is None or img.isNull():
+                return
+            # 上下贴边时 pet_label 放大为窗口尺寸
+            self.pet_label.setFixedSize(self.width(), self.height())
+            canvas = QPixmap(self.width(), self.height())
+            canvas.fill(Qt.transparent)
+            p = QPainter(canvas)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            scaled = img.scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            # 缩小到 65%，避免过大压迫感
+            scaled = scaled.scaled(int(scaled.width() * 0.65), int(scaled.height() * 0.65),
+                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            # 对齐：top 立绘手在图片上边缘 → 顶部对齐（手贴屏幕顶缘）
+            #      bottom 立绘手在图片下边缘 → 底部对齐（手贴屏幕底缘）
+            if side == 'top':
+                draw_y = 0
+            else:
+                draw_y = self.height() - scaled.height()
+            p.drawPixmap(int((self.width() - scaled.width()) / 2), draw_y, scaled)
+            p.end()
+            self.pet_label.setPixmap(canvas)
+
+    def _show_state_image(self, st):
+        """显示状态立绘（sleep/happy/thinking/scared/...；Live2D 模式由模型代替）
+        （实现已搬至 pet_anim.show_state_image）"""
+        return anim.show_state_image(self, st)
+    # ---------- 气泡（预设短台词 ≤20 字，不挡脸） ----------
+    def _place_bubble(self):
+        """气泡悬浮在窗口顶部（pet_label 上方区域）"""
+        self.bubble.raise_()  # 置顶：防止被 pet_label（后创建，z-order 更高）遮挡
+        # v6.51：气泡是窗口的子控件，而扒边/隐藏模式会把窗口缩窄（左右扒边缩到 pet_size 宽），
+        # 原先只做居中、不缩气泡宽度 → 长句被窗口硬裁掉半截。这里按窗口实际宽度夹一下。
+        avail = max(40, self.width() - 8)
+        bw = min(max(self.bubble.sizeHint().width(), 40), 380, avail)
+        bh = self.bubble.sizeHint().height()
+        bx = max(0, (self.width() - bw) // 2)
+        by = 6
+        self.bubble.setGeometry(bx, by, bw, bh)
+        self._place_status_bar()   # v6.60 批 2：窗口尺寸变化时状态条跟着走
+
+    # ---- v6.60 气泡节奏参数（集中在此便于调，改完跑 tests/test_bubble_pacing.py） ----
+    BUBBLE_HOLD_MIN_MS = 6000        # 最短停留：关心类不能一闪而过
+    BUBBLE_HOLD_PER_CHAR = 120       # 每字读字时间
+    BUBBLE_HOLD_BASE_MS = 3000       # 停留基数
+    BUBBLE_TYPE_FAST_MS = 26         # 逐字最快
+    BUBBLE_TYPE_SLOW_MS = 48         # 逐字最慢（随机，不做等速打字机）
+    BUBBLE_PAUSE_COMMA_MS = 120      # 逗号后停顿
+    BUBBLE_PAUSE_SENTENCE_MS = 260   # 句末标点后停顿
+    BUBBLE_PAUSE_NEWLINE_MS = 200    # 换行后停顿
+    BUBBLE_LONG_TEXT_CHARS = 40      # 超过此长度整段渐显（不逐字）
+    BUBBLE_THINK_TICKS = 3           # “思考”点数
+    BUBBLE_THINK_MS = 120            # 每个思考点间隔
+    BUBBLE_QUEUE_MAX = 2             # 排队上限
+    BUBBLE_GAP_MS = 600              # 两条气泡之间的间隔
+    # 关心气泡（v6.60 批 3）：停留更久，否则用户还没读到就消失了
+    BUBBLE_CARE_MIN_MS = 8000
+    BUBBLE_CARE_PER_CHAR = 150
+    BUBBLE_CARE_BASE_MS = 4000
+
+    def _bubble_hold_ms(self, text=None):
+        """一条气泡应停留多久（v6.60；关心类另有更长的下限）"""
+        t = self.type_buffer if text is None else str(text)
+        if getattr(self, '_bubble_mode', 'say') == 'care':
+            return max(self.BUBBLE_CARE_MIN_MS,
+                       len(t) * self.BUBBLE_CARE_PER_CHAR + self.BUBBLE_CARE_BASE_MS)
+        return max(self.BUBBLE_HOLD_MIN_MS,
+                   len(t) * self.BUBBLE_HOLD_PER_CHAR + self.BUBBLE_HOLD_BASE_MS)
+
+    def _schedule_bubble_hide(self, extra_ms=0):
+        """开始倒计时隐藏（悬停中则不启动）"""
+        if getattr(self, '_bubble_hover_paused', False):
+            return
+        self.bubble_hide_timer.start(self._bubble_hold_ms() + extra_ms)
+
+    def say_plain(self, text, immediate=False):
+        """气泡显示短文本（v6.60 拟人化改造）
+
+        - 节奏：先"思考"3 个点 → 逐字（字速 26–48ms 随机 + 标点停顿）→ 超 40 字整段渐显
+        - 停留：max(6s, 字数×120ms+3s)；鼠标悬停暂停
+        - 队列：正在显示时新消息**排队**（上限 2 条）而不是覆盖旧的
+        - immediate=True：跳过打字机（状态/关心类提示），仍走队列与停留规则
+        v6.25.1 非主线程调用自动转发主线程（防 Qt 跨线程崩溃）
+        """
+        text = self._strip_emotion_tags(str(text))[0]  # v6.40 出口统一剥 emotion 标签
+        if not text:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            self._run_on_ui(lambda t=text, i=immediate: self.say_plain(t, i))  # v6.58
+            return
+        if self._speak_busy:
+            # 正在说 → 排队，不再互相覆盖
+            if len(self._speak_queue) < self.BUBBLE_QUEUE_MAX:
+                self._speak_queue.append((str(text), bool(immediate)))
+            return
+        self._speak_begin(str(text), immediate)
+
+    def _speak_begin(self, text, immediate=False):
+        """开始显示一条气泡（内部）"""
+        self._speak_busy = True
+        self.type_buffer = str(text)
+        self.type_index = 0
+        self.bubble_hide_timer.stop()
+        self.bubble.show()
+        if immediate or len(self.type_buffer) > self.BUBBLE_LONG_TEXT_CHARS:
+            # 状态/关心类与长文本：不逐字（避免久等），直接给完整内容
+            self.type_timer.stop()
+            self.type_index = len(self.type_buffer)
+            self.bubble.setText(self.type_buffer)
+            self._place_bubble()
+            self._schedule_bubble_hide()
+            return
+        # 短句：先“思考”再开口，像人在组织语言
+        self._speak_think_ticks = 0
+        self.bubble.setText('·')
+        self._place_bubble()
+        self.type_timer.start(self.BUBBLE_THINK_MS)
+
+    def _type_next(self):
+        """打字机（v6.60）：思考阶段 → 逐字阶段（标点停顿 + 随机字速）"""
+        if self._speak_think_ticks < self.BUBBLE_THINK_TICKS:
+            self._speak_think_ticks += 1
+            self.bubble.setText('·' * min(self.BUBBLE_THINK_TICKS, self._speak_think_ticks + 1))
+            self._place_bubble()
+            if self._speak_think_ticks >= self.BUBBLE_THINK_TICKS:
+                self.type_timer.stop()
+                self.type_index = 0
+                self.bubble.setText('')
+                self._place_bubble()
+                self.type_timer.start(self._char_delay(1))
+            return
+        if self.type_index < len(self.type_buffer):
+            self.type_index += 1
+            self.bubble.setText(self.type_buffer[:self.type_index])
+            self._place_bubble()
+            self.type_timer.start(self._char_delay(self.type_index))
+        else:
+            self.type_timer.stop()
+            self._schedule_bubble_hide()
+
+    def _char_delay(self, pos):
+        """逐字间隔（v6.60）：标点后停顿 + 26–48ms 随机"""
+        txt = self.type_buffer
+        prev = txt[pos - 1] if 0 < pos <= len(txt) else ''
+        if prev in '。！？!?…':
+            return self.BUBBLE_PAUSE_SENTENCE_MS
+        if prev in '，,、；;：':
+            return self.BUBBLE_PAUSE_COMMA_MS
+        if prev == '\n':
+            return self.BUBBLE_PAUSE_NEWLINE_MS
+        return random.randint(self.BUBBLE_TYPE_FAST_MS, self.BUBBLE_TYPE_SLOW_MS)
+
+    def _hide_bubble(self):
+        """隐藏气泡，并取出排队的下一条（v6.60：队列代替覆盖）"""
+        self.bubble.hide()
+        self.type_timer.stop()
+        self.bubble_hide_timer.stop()
+        self._speak_busy = False
+        # v6.60 批 3 / v6.61：扒边探头后自动收回（收回路径收敛至 _rehide_after_probe）
+        if getattr(self, '_dock_rehide', False):
+            self._rehide_after_probe()
+        if self._speak_queue:
+            text, immediate = self._speak_queue.pop(0)
+            QTimer.singleShot(self.BUBBLE_GAP_MS,
+                              lambda t=text, i=immediate: self._speak_begin(t, i))
+
+    def _bubble_hover(self, on):
+        """悬停暂停（v6.60）：移入→停住不倒计时；移开→再给 2 秒后继续"""
+        self._bubble_hover_paused = bool(on)
+        if on:
+            self.bubble_hide_timer.stop()
+            self.type_timer.stop()
+        elif self.bubble.isVisible() or self._speak_busy:
+            if self._speak_busy:
+                self.type_timer.start(self._char_delay(max(1, self.type_index)))
+            else:
+                self._schedule_bubble_hide(extra_ms=2000)
+
+    # ---- v6.60 批 2：系统状态条 ----
+    # 系统通知（配置变更 / 文件操作 / 能力可用性 / 进度）原先以「桌宠」身份写进聊天列表，
+    # 使用者反馈「污染会话、太人机」。现改为窗口底部一条细状态条：
+    # 不进聊天列表（display_msgs）、不进模型上下文（chat_history_msgs），只额外记一条日志。
+    STATUS_MS = 2500                     # 状态条默认停留时长
+    COST_NOTIFY_MS = 6000                # 费用提示停留时长（v6.61：太短看不清）
+
+    def _init_status_bar(self):
+        """创建底部状态条（悬浮定位，不参与布局，避免挤压立绘导致上下跳动）"""
+        self.status_bar = QLabel('', self)
+        self.status_bar.setParent(self)
+        self.status_bar.setAlignment(Qt.AlignCenter)
+        self.status_bar.setMaximumHeight(40)
+        self.status_bar.setAttribute(Qt.WA_TransparentForMouseEvents, True)  # 不挡立绘点击
+        self.status_bar.hide()
+        self._style_status_bar()
+        self.status_hide_timer = QTimer(self)
+        self.status_hide_timer.setSingleShot(True)
+        self.status_hide_timer.timeout.connect(self.status_bar.hide)
+
+    def _style_status_bar(self):
+        """状态条配色走主题 token（不写死颜色；切主题时由 _apply_theme 重新调用）"""
+        try:
+            t = self.theme or {}
+            bg = t.get('say_bg') or t.get('panel_bg') or t.get('ui_board_bg')
+            fg = t.get('hint_text') or t.get('text') or t.get('ui_text')
+            bd = t.get('say_border') or bg
+            if bg and fg:
+                self.status_bar.setStyleSheet(
+                    'QLabel{background:%s;color:%s;border:1px solid %s;'
+                    'border-radius:4px;padding:2px 8px;font-size:11px;}' % (bg, fg, bd))
+        except Exception as e:
+            log.debug('状态条样式应用失败：%s', e)
+
+    def _place_status_bar(self):
+        """贴在窗口底部（窗口小且会随扒边变窄，这里按实际宽度夹一下）"""
+        try:
+            if not self.status_bar.isVisible():
+                return
+            avail = max(60, self.width() - 8)
+            w = min(max(self.status_bar.sizeHint().width(), 60), avail)
+            h = min(max(self.status_bar.sizeHint().height(), 16), 40)
+            self.status_bar.setGeometry(4, max(0, self.height() - h - 2), w, h)
+            self.status_bar.raise_()
+        except Exception:
+            pass
+
+    def _notify(self, text, ms=None):
+        """系统状态提示（v6.60 批 2）：底部状态条 + 日志；不写聊天列表、不进模型上下文。
+
+        取代原先「系统通知以桌宠身份写进聊天记录」的做法。非主线程调用自动转主线程。
+        """
+        text = self._strip_emotion_tags(str(text))[0].strip()
+        if not text:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            self._run_on_ui(lambda t=text, m=ms: self._notify(t, m))
+            return
+        try:
+            log.info('状态条：%s', text)
+        except Exception:
+            pass
+        if getattr(self, 'status_bar', None) is None:
+            return
+        self.status_bar.setText(text)
+        self.status_bar.show()
+        self._place_status_bar()
+        self.status_hide_timer.start(int(ms or self.STATUS_MS))
+
+    # ---- v6.60 批 3：关心通道（独立外观 + 可点开接话 + 回忆日志留痕） ----
+    # 此前关心/回访/提醒与系统提示共用一个气泡外观、且“气泡 + 聊天列表”各写一遍（重复），
+    # 使用者反馈「开了主动关心会混在一起、效果不明显」。现关心走独立样式与独立记录。
+    _CARE_LABEL = {'care': '主动关心', 'remind': '提醒', 'greet': '问候'}
+
+    def say_care(self, text, kind='care'):
+        """关心气泡（v6.60 批 3）
+
+        - 外观：左侧 accent 色条（与普通说话气泡一眼分开）
+        - 鼠标变手型 + tooltip，点一下 → 展开到聊天列表（可接着回）
+        - 留痕：写入回忆日志（memory_events）；**不写聊天列表、不进模型上下文**
+        - 停留：≥8 秒，且悬停暂停（见 _bubble_hold_ms）
+        非主线程调用自动转主线程。
+        """
+        text = self._strip_emotion_tags(str(text))[0].strip()
+        if not text:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            self._run_on_ui(lambda t=text, k=kind: self.say_care(t, k))
+            return
+        self._bubble_mode = 'care'
+        self._care_click_text = text
+        self._care_kind = kind if kind in self._CARE_LABEL else 'care'
+        try:
+            pb.apply_say_bubble_theme(self.bubble, self.theme, 'care')
+            self.bubble.setCursor(Qt.PointingHandCursor)
+            self.bubble.setToolTip('点一下 → 展开到聊天，接着聊')
+        except Exception as e:
+            log.debug('关心气泡样式失败：%s', e)
+        try:
+            label = self._CARE_LABEL.get(self._care_kind, '关心')
+            self.memories.add(self.current, 'event',
+                              '%s：%s' % (label, text[:28]),
+                              text)
+        except Exception as e:
+            log.debug('关心入回忆日志失败：%s', e)
+        # 一次性提示（本次运行第一条关心）：告知气泡可点（不污染聊天列表）
+        if not getattr(self, '_care_hint_shown', False):
+            self._care_hint_shown = True
+            self._notify('提示：点一下关心气泡可展开到聊天', ms=4000)
+        self._speak_begin(text, immediate=False)
+
+    def _reset_bubble_mode(self):
+        """回到普通说话气泡样式（v6.60 批 3）"""
+        self._bubble_mode = 'say'
+        self._care_click_text = ''
+        try:
+            pb.apply_say_bubble_theme(self.bubble, self.theme, 'say')
+            self.bubble.setCursor(Qt.ArrowCursor)
+            self.bubble.setToolTip('')
+        except Exception:
+            pass
+
+    def _bubble_clicked(self, event=None):
+        """点关心气泡 → 展开到聊天列表并打开聊天窗（v6.60 批 3）
+
+        普通说话气泡点击无副作用（不把自言自语塞进聊天记录）。
+        注意：只有用户显式点击才写聊天列表——这是「关心不污染会话」与「可接着聊」的平衡点。
+        """
+        try:
+            if self._bubble_mode == 'care' and self._care_click_text:
+                text = self._care_click_text
+                self._reset_bubble_mode()
+                # v6.61：扒边窄窗里展开聊天会被截断 —— 用户主动点击时允许弹出（不算「自动探头」）
+                if self._edge_side is not None and self._edge_mode == 'peek' and not self._edge_popped:
+                    try:
+                        self._popup_from_dock()
+                        self._dock_rehide = False
+                    except Exception as e:
+                        log.debug('点关心气泡时弹出失败：%s', e)
+                self._append_chat('桌宠', text)
+                self.chat_panel.show()
+                self._chat_scroll_bottom()
+                self._hide_bubble()
+                return
+            # 普通气泡：点击不做事（事件交回默认处理）
+            if event is not None and hasattr(QLabel, 'mousePressEvent'):
+                QLabel.mousePressEvent(self.bubble, event)
+        except Exception as e:
+            log.debug('关心气泡展开失败：%s', e)
+
+    def show_emotion(self, emoji, ms=2000):
+        """头顶 emoji 气泡（情绪表达，不挡脸）"""
+        self.bubble.setText(str(emoji))
+        self.bubble.show()
+        self._place_bubble()
+        self.bubble_hide_timer.start(ms)
+
+    # ---------- 说话/思考 ----------
+    def _char_lines(self, key):
+        """按当前语言取角色台词（greetings/think_lines/happy_lines/scared_lines）"""
+        conf = CHARACTERS[self.current]
+        if getattr(self, 'language', 'zh') == 'en':
+            return conf.get(key + '_en') or conf.get(key) or []
+        return conf.get(key) or []
+
+    def say_random(self):
+        """随机说一句问候（实现已搬至 pet_anim.say_random）"""
+        return anim.say_random(self)
+    def do_thinking(self):
+        """思考状态（3 秒后恢复）"""
+        if self.sleeping:
+            return
+        self.state = 'thinking'
+        self.phase = 0
+        lines = self._char_lines('think_lines')
+        text = random.choice(lines) if lines else 'Hmm…'
+        self.say_plain(text)
+        self._notify(text)
+        self._show_state_image('thinking')
+        if self.thinking_timer is not None:
+            self.thinking_timer.stop()
+        self.thinking_timer = QTimer(self)
+        self.thinking_timer.setSingleShot(True)
+        self.thinking_timer.timeout.connect(self._end_thinking)
+        self.thinking_timer.start(3000)
+
+    def _end_thinking(self):
+        if not self.sleeping and self.state == 'thinking':
+            self.state = 'idle'
+            self._show_idle()
+
+    def _restore_state_after_emotion(self):
+        """情绪立绘结束后恢复待机（实现已搬至 pet_anim.restore_after_emotion）"""
+        return anim.restore_after_emotion(self)
+    # ---------- 场景动作 ----------
+    def play_scene(self, key):
+        """播放场景动作立绘（6 秒后恢复待机）
+        （实现已搬至 pet_anim.play_scene）"""
+        return anim.play_scene(self, key)
+    def _end_scene(self):
+        """场景动作结束：恢复待机（实现已搬至 pet_anim.end_scene）"""
+        return anim.end_scene(self)
+    # ---------- 眨眼 ----------
+    def _do_blink(self):
+        """眨眼定时器回调（实现已搬至 pet_anim.blink_tick）"""
+        return anim.blink_tick(self)
+    def _blend_end(self):
+        """眨眼结束收尾（实现已搬至 pet_anim.blend_end）"""
+        return anim.blend_end(self)
+    # ---------- 聊天窗口 ----------
+    def _record_api_usage(self, resp, fallback_model=''):
+        """从 API 响应解析 usage 并记录（v6.18 自监控）
+
+        fallback_model：流式响应体不带 model 字段时，用本次实际请求的模型补上
+        （原先流式只传 usage → model 为空串 → 费用一律按兜底价算）"""
+        try:
+            dbg = os.path.join(BASE_DIR, '_apistats_debug.log')
+            with open(dbg, 'a', encoding='utf-8') as _f:
+                _f.write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
+                         f"type={type(resp).__name__} keys={list(resp.keys())[:6] if isinstance(resp, dict) else '-'} "
+                         f"usage={'有' if isinstance(resp, dict) and resp.get('usage') else '无'}\n")
+        except Exception as _exc:
+            _silent_log('_record_api_usage:3839', _exc)   # v6.54
+        try:
+            if not isinstance(resp, dict):
+                return
+            usage = resp.get('usage')
+            if not usage:
+                return
+            model = resp.get('model') or fallback_model or ''
+            cost = self.api_stats.record(usage, model)
+            # v6.62：模型没配价格时提醒一次（不再拿别人价目编数字，但要让用户知道钱没算上）
+            try:
+                _last = self.api_stats.last or {}
+                if _last.get('price_unknown') and not getattr(self, '_unknown_price_notified', False):
+                    self._unknown_price_notified = True
+                    if model:
+                        self._notify('⚠ 模型 %s 未配置价格，费用未计入「设置 → 模型管理」可填' % model,
+                                     ms=self.COST_NOTIFY_MS)
+            except Exception as _exc:
+                _silent_log('_record_api_usage:price_unknown', _exc)
+            if cost:
+                self.cost_bubble_signal.emit(cost)  # v6.30 费用气泡
+            # v6.61：余额缓存过期（默认 10 分钟）→ 后台静默刷一次（不弹提示、不阻塞）
+            try:
+                if self.api_stats.balance_stale(getattr(self, 'balance_auto_minutes', 10)):
+                    self._query_balance_async(manual=False)
+            except Exception:
+                pass
+        except Exception as _exc:
+            _silent_log('_record_api_usage:3851', _exc)   # v6.54
+
+    def _show_api_stats_history(self):
+        """显示最近 API 调用历史（消息框）"""
+        from PySide6.QtWidgets import QMessageBox
+        st = self.api_stats
+        with st.lock:
+            calls = list(reversed(st.calls[-20:]))
+            today = dict(st.today)
+            total = dict(st.total)
+        lines = [f"今日 {today.get('count',0)}次/{today.get('total',0)}tok/{today.get('cost',0):.3f}元 · 累计 {total.get('count',0)}次/{total.get('total',0)}tok/{total.get('cost',0):.3f}元", '']
+        if not calls:
+            lines.append('（暂无调用记录——发消息后自动统计）')
+        for c in calls:
+            flag = ' ⚠价格未知' if c.get('price_unknown') else ''
+            lines.append(f"{c['time']} {c['model']} in{c['prompt']} out{c['completion']} 缓存{c['cache_hit']}hit {c['cost']:.4f}元{flag}")
+        QMessageBox.information(self, 'API 统计历史', '\n'.join(lines))
+
+    def _show_model_stats(self):
+        """按模型汇总用量与费用（含价格未知提示）——看清钱花在哪个模型上"""
+        from PySide6.QtWidgets import QMessageBox
+        rows = self.api_stats.model_breakdown()
+        if not rows:
+            QMessageBox.information(self, '按模型统计', '（暂无调用记录——发消息后自动统计）')
+            return
+        lines = ['按模型汇总（终身口径）', '']
+        for r in rows:
+            lines.append('· %s' % r.get('model', '?'))
+            lines.append('    %d 次 · 输入 %s / 输出 %s · 费用 %.4f 元'
+                         % (r.get('count', 0), format(r.get('prompt', 0), ','),
+                            format(r.get('completion', 0), ','), float(r.get('cost') or 0)))
+            if r.get('unknown'):
+                lines.append('    ⚠ 其中 %d 次价格未知（按兜底价估算，去「模型管理」把价格补上）'
+                             % r['unknown'])
+        tot = sum(float(r.get('cost') or 0) for r in rows)
+        unk = sum(int(r.get('unknown') or 0) for r in rows)
+        lines.append('')
+        lines.append('合计 %.4f 元' % tot
+                     + ('；其中 %d 次是价格未知的估算' % unk if unk else ''))
+        QMessageBox.information(self, '按模型统计', '\n'.join(lines))
+
+    def _toggle_api_stats_window(self):
+        """开关 API 统计悬浮窗（透明置顶小窗，实时刷新 + 缓存命中率图表）"""
+        WIN_W = 320          # v6.62：宽度固定 320，高度按内容算（不再写死）
+        if self._api_stats_win is not None:
+            try:
+                self._api_stats_win.close()
+            except Exception:
+                pass
+            self._api_stats_win = None
+            return
+        from PySide6.QtWidgets import QVBoxLayout as _VL, QProgressBar, QPushButton
+        win = QWidget()
+        win.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
+                           Qt.Tool | Qt.NoDropShadowWindowHint)
+        win.setAttribute(Qt.WA_TranslucentBackground)
+        self._set_themed_qss(win, lambda: (          # v6.58 主题化
+            "QWidget#ap { background: %s; border: 1px solid %s;" % (self._tk('ui_stats_bg'), self._tk('ui_border_soft'))
+            + " border-radius: 10px; }"
+            + "QLabel { color: %s; font-size: 11px; background: transparent; }" % self._tk('ui_text')
+            + "QLabel#t { color: %s; font-size: 12px; font-weight: bold; }" % self._tk('ui_accent')
+            + "QLabel#v { color: %s; font-size: 11px; }" % self._tk('ui_green')
+            + "QLabel#d { color: %s; font-size: 10px; }" % self._tk('ui_text_dim')
+            + "QProgressBar { background: %s; border: none; border-radius: 4px;" % self._tk('ui_stats_track')
+            + " text-align: center; color: %s; font-size: 10px; }" % self._tk('ui_text')
+            + "QProgressBar::chunk { background: %s; border-radius: 4px; }" % self._tk('ui_green')))
+        panel = QWidget(win)
+        panel.setObjectName('ap')
+        v = _VL(panel)
+        v.setContentsMargins(10, 6, 10, 6)
+        v.setSpacing(3)
+        title = QLabel('\U0001F4CA API 统计')
+        title.setObjectName('t')
+        v.addWidget(title)
+
+        def _fmt(n):
+            try:
+                n = float(n or 0)
+            except Exception:
+                return '0'
+            if n >= 1e8:
+                return f'{n/1e8:.1f}亿'
+            if n >= 1e4:
+                return f'{n/1e4:.1f}万'
+            if n >= 1e3:
+                return f'{n/1e3:.1f}k'
+            return f'{int(n)}'
+
+        l_last = QLabel('最近: —'); l_last.setObjectName('v')
+        l_cache = QLabel('缓存: —'); l_cache.setObjectName('d')
+        cache_bar = QProgressBar()
+        cache_bar.setRange(0, 100)
+        cache_bar.setValue(0)
+        cache_bar.setFixedHeight(10)
+        l_today = QLabel('今日: —'); l_today.setObjectName('v')
+        l_total = QLabel('累计: —'); l_total.setObjectName('v')
+        l_app = QLabel('来源: —'); l_app.setObjectName('d')
+        l_bal = QLabel('余额: 未查询'); l_bal.setObjectName('v')   # v6.61
+        l_bal.setWordWrap(False)                                   # v6.62：不允许换行撑宽窗口
+        lbl_slot = QLabel('时段: —'); lbl_slot.setObjectName('d')   # v6.62：当前是按高峰还是空闲计价
+        # v6.62：未配置价格的调用单独一行（不塞进「今日」行 —— 那行会被按像素收口截掉）
+        lbl_unk = QLabel(''); lbl_unk.setObjectName('d')
+        btn_bal = QPushButton('💰 查询余额')
+        btn_bal.setFixedWidth(150)      # v6.62：只占一半宽，四周留出可拖动区域
+        btn_bal.clicked.connect(lambda: self._query_balance_async(True))
+        v.addWidget(l_last); v.addWidget(l_cache); v.addWidget(cache_bar)
+        v.addWidget(l_today); v.addWidget(l_total); v.addWidget(l_app)
+        v.addWidget(lbl_slot)
+        v.addWidget(lbl_unk)
+        v.addWidget(l_bal); v.addWidget(btn_bal, 0, Qt.AlignHCenter)
+
+        def refresh():
+            st = self.api_stats
+            with st.lock:
+                last = st.last
+                today = dict(st.today)
+                total = dict(st.total)
+            if last:
+                warn = '  ⚠ 价格未知（按兜底价估算）' if last.get('price_unknown') else ''
+                l_last.setText(f"最近: {last['model']} {_fmt(last['prompt'])}in/{_fmt(last['completion'])}out "
+                               f"{last['cost']:.4f}元{warn}")
+            hit = today.get('cache_hit', 0) or 0
+            miss = today.get('cache_miss', 0) or 0
+            l_cache.setText(f"缓存: {_fmt(hit)} 命中 / {_fmt(miss)} 未命中")
+            total_in = hit + miss
+            rate = int(hit / total_in * 100) if total_in else 0
+            cache_bar.setValue(rate)
+            cache_bar.setFormat(f'缓存命中率 {rate}%')
+            l_today.setText(f"今日: {today.get('count',0)}次 · {_fmt(today.get('total',0))} tok · {today.get('cost',0):.4f}元")
+            l_total.setText(f"累计: {total.get('count',0)}次 · {_fmt(total.get('total',0))} tok · {total.get('cost',0):.4f}元")
+            by_app = today.get('by_app', {})
+            if by_app:
+                # v6.62：来源行可能无限长（多个 app），只列前 3 个并截断，避免把窗口顶宽
+                _items = list(by_app.items())[:3]
+                parts = [f"{k} {v['count']}次/{_fmt(v['total'])}tok" for k, v in _items]
+                if len(by_app) > 3:
+                    parts.append('…')
+                l_app.setText(('来源: ' + ' · '.join(parts))[:64])
+            else:
+                l_app.setText('来源: —')
+            # v6.61：余额常驻行（无缓存时明说「未查询」，不编数字）
+            # v6.62 fix：文案改短 + 完整信息进 tooltip —— 原先「余额: ¥70.68（赠金 …）· 3 分钟前更新」
+            # 把 320px 窗口的布局最小宽度顶到 361px（装不下 → 挤压/抖动）
+            try:
+                short = st.balance_text(False)
+                if short:
+                    l_bal.setText('余额: %s · %s' % (short, st.balance_updated_text()))
+                    l_bal.setToolTip(st.balance_text(True) + '\n' + st.balance_updated_text())
+                else:
+                    l_bal.setText('余额: 未查询（点下面按钮查）')
+                    l_bal.setToolTip('')
+            except Exception:
+                l_bal.setText('余额: —')
+            # v6.62：当前按高峰还是空闲计价（用北京时间，与用户时区/本机时钟无关）
+            try:
+                import server_clock as _sc
+                _bj = _sc.beijing_now()
+                _peak = self.api_stats.is_peak_now(_bj)
+                _txt = '时段: %s（北京 %s）' % ('高峰' if _peak else '空闲',
+                                              _bj.strftime('%m-%d %H:%M'))
+                _skew = _sc.skew_text()
+                if _skew:
+                    _txt += ' · ' + _skew
+                lbl_slot.setText(_txt)
+                lbl_slot.setToolTip('官方峰谷定价：高峰=北京时间周一至周五 9:00–12:00、14:00–18:00（不含法定节假日）；'
+                                    '其余（含周末与节假日）为空闲，空闲价是高峰的一半')
+            except Exception:
+                lbl_slot.setText('时段: —')
+            # v6.62：未配置价格的调用单独提示（不编数字，用户能一眼看出钱没算上）
+            try:
+                _unk = (st.today.get('unknown', 0) or 0)
+                if _unk:
+                    lbl_unk.setText('⚠ %d 次调用未配价格，未计入费用' % _unk)
+                    lbl_unk.setToolTip('有模型没配价格（如第三方模型），这部分费用未计入统计 —— '
+                                       '可在「设置 → 模型管理」填价格')
+                else:
+                    lbl_unk.setText('')
+                    lbl_unk.setToolTip('')
+            except Exception:
+                lbl_unk.setText('')
+            # v6.62 fix：最后统一按像素宽收口 —— 任何一行（尤其「来源」多 app）
+            # 都不允许把窗口顶宽（之前内容 620px 塞 320px 窗口 → 挤压/发沏）
+            try:
+                _budget = max(80, int(WIN_W) - 26)
+                for _l in (l_last, l_cache, l_today, l_total, l_app, l_bal, lbl_slot, lbl_unk):
+                    _t = _l.text()
+                    _fm = QFontMetrics(_l.font())
+                    if _fm.horizontalAdvance(_t) > _budget:
+                        _l.setText(_fm.elidedText(_t, Qt.ElideRight, _budget))
+            except Exception:
+                pass
+            _fit_window()   # v6.70：内容变了就重新贴合窗口（余额/来源到达时不再挤压）
+
+        timer = QTimer(win)  # 父对象 win，防止被 GC 导致悬浮窗不刷新
+        timer.timeout.connect(refresh)
+        timer.start(1000)
+
+        # v6.62 fix：窗口任意位置都能拖（原先只有 panel 能拖，抓到按钮/边缘就「拖不动」）；
+        # 拖动期间暂停 1 秒刷新，避免刷新与移动互相干扰；松手后记住位置
+        _drag = {'on': False, 'x': 0, 'y': 0}
+
+        def _drag_handler(obj, ev):
+            t = ev.type()
+            if t == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+                if isinstance(obj, QPushButton):
+                    return False                       # 按钮保留点击语义
+                _drag['on'] = True
+                _drag['x'] = int(ev.globalPosition().x() - win.x())
+                _drag['y'] = int(ev.globalPosition().y() - win.y())
+                timer.stop()
+                return False
+            if t == QEvent.MouseMove and _drag['on']:
+                win.move(int(ev.globalPosition().x() - _drag['x']),
+                         int(ev.globalPosition().y() - _drag['y']))
+                return True
+            if t == QEvent.MouseButtonRelease and _drag['on']:
+                _drag['on'] = False
+                timer.start(1000)
+                try:
+                    self._save_cfg_value('stats_win_pos', [win.x(), win.y()])
+                except Exception:
+                    pass
+                return True
+            return False
+
+        class _DragFilter(QObject):
+            def eventFilter(self, obj, ev):
+                try:
+                    return bool(_drag_handler(obj, ev))
+                except Exception:
+                    return False
+
+        _df = _DragFilter(win)
+        for _w in [win, panel] + panel.findChildren(QWidget):
+            _w.installEventFilter(_df)
+
+        win.setContextMenuPolicy(Qt.CustomContextMenu)
+        def _menu(pos):
+            m = QMenu(win)
+            a = m.addAction('关闭统计')
+            a.triggered.connect(lambda: self._toggle_api_stats_window())
+            m.exec(win.mapToGlobal(pos))
+        win.customContextMenuRequested.connect(_menu)
+
+        def _fit_window():
+            """v6.70：按内容自适应窗口宽高（含布局最小尺寸），任何时刻（含余额加载后）都不挤压。
+
+            旧实现的问题：`win.setFixedHeight(panel.sizeHint().height())` 取的是**刷新前**的
+            估值，且第二次 refresh() 之后没有重算布局 → 字体正常（文字有真实宽高）时
+            “最胖内容”装不下 → 真机出现挤压 / 拖不动（使用者反馈）。
+            另外旧实现只在开窗时算一次，余额 / 来源行后来变胖就不会再贴合。
+            """
+            nonlocal WIN_W
+            try:
+                v.activate()
+                _need_w = max(panel.sizeHint().width(), v.minimumSize().width())
+                WIN_W = min(460, max(320, _need_w))
+                panel.setFixedWidth(WIN_W)
+                win.setFixedWidth(WIN_W)
+                v.activate()
+                _need_h = max(panel.sizeHint().height(), v.minimumSize().height())
+                win.setFixedHeight(max(120, _need_h + 2))
+            except Exception as e:
+                log.debug('统计窗自适应尺寸失败：%s', e)
+
+        panel.setFixedWidth(WIN_W)
+        refresh()
+        panel.adjustSize()
+        _fit_window()
+        win.setToolTip('按住窗口任意位置拖动 · 右键菜单可关闭')
+        try:
+            with open(CONFIG_PATH, encoding='utf-8') as _f:
+                _p = (json.load(_f) or {}).get('stats_win_pos')
+        except Exception:
+            _p = None
+        if isinstance(_p, (list, tuple)) and len(_p) == 2:
+            win.move(int(_p[0]), int(_p[1]))
+        else:
+            win.move(40, 40)
+        win.show()
+        self._api_stats_win = win
+
+    def _new_bubble(self, who, ts, is_user=False, text=''):
+        """创建消息气泡（头部名字+时间+操作按钮 + 空内容区），追加到消息流（v6.19 微信式左右布局）
+        is_user=True 时名字靠右（用户消息），False 时靠左（桌宠/AI 消息）"""
+        self._hide_empty_hint()   # v6.81：有气泡了，占位提示就收起来
+        bubble = QFrame()
+        v = QVBoxLayout(bubble)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        name = QLabel(who)
+        name_color = self.theme.get('name_user') if is_user else self.theme.get('name_ai')
+        name.setStyleSheet(f'color:{name_color};font-size:11px;font-weight:bold;background:transparent;')
+        self._register_theme_widget(name, 'name', is_user)  # v6.58 切主题时名字色同步
+        tl = QLabel(ts)
+        tl.setStyleSheet(f'color:{self._tk("ui_text_muted")};font-size:10px;background:transparent;')
+        if is_user:
+            head.addStretch(1)
+            head.addWidget(name)
+            head.addWidget(tl)
+        else:
+            head.addWidget(name)
+            head.addWidget(tl)
+            head.addStretch(1)
+        # 操作按钮：一键复制 / 存为图片（hover 消息才显示，v6.19e；不污染对话历史）
+        self._attach_bubble_actions(bubble, text)
+        v.addLayout(head)
+        content = QVBoxLayout()
+        content.setSpacing(4)
+        v.addLayout(content)
+        self.chat_history_layout.insertWidget(self.chat_history_layout.count() - 1, bubble)
+        return bubble, content
+
+    def _bubble_text_label(self, html_text, is_user=False):
+        """消息文本标签：富文本（<b>/<i>/<br> 等），自动换行，可选中复制；
+        用户/AI 不同背景色+对齐（v6.19 对比度增强 + v6.23 主题变量）
+        （实现已搬至 pet_bubble.bubble_text_label；v6.58 登记为受主题控件，切主题时刷新）"""
+        lbl = pb.bubble_text_label(html_text, self.theme, is_user=is_user)
+        self._register_theme_widget(lbl, 'text', is_user)
+        return lbl
+    def _copy_message_text(self, text):
+        """复制单条消息文本到剪贴板（用气泡提示，不污染对话历史）"""
+        try:
+            if pl.clipboard_set(str(text)):
+                self.say_plain('✅ 已复制该消息', immediate=True)
+            else:
+                self.say_plain('复制失败', immediate=True)
+        except Exception:
+            self.say_plain('复制失败', immediate=True)
+
+    def _save_bubble_image(self, bubble):
+        """把消息气泡渲染成 PNG 图片保存（合成深色背景，与聊天面板风格一致）"""
+        from PySide6.QtWidgets import QFileDialog
+        try:
+            default = os.path.join(os.path.expanduser('~'), 'Desktop', '桌宠消息.png')
+            path, _ = QFileDialog.getSaveFileName(self, '保存消息为图片', default, 'PNG 图片 (*.png)')
+            if not path:
+                return
+            pm = bubble.grab()
+            if pm.isNull():
+                self.say_plain('截图失败', immediate=True)
+                return
+            bg = QPixmap(pm.size())
+            bg.fill(QColor(20, 20, 30))
+            p = QPainter(bg)
+            p.drawPixmap(0, 0, pm)
+            p.end()
+            if bg.save(path):
+                self.say_plain(f'✅ 已保存：{os.path.basename(path)}', immediate=True)
+            else:
+                self.say_plain('保存失败', immediate=True)
+        except Exception as e:
+            self.say_plain(f'保存失败：{e}', immediate=True)
+
+    def _check_code_blocks(self, text):
+        """自动检查回复中 Python 代码块语法（拆至 code_checker.check_python_blocks）
+        （实现已搬至 pet_bubble.check_code_blocks）"""
+        return pb.check_code_blocks(text)
+    def _maybe_append_code_warning(self):
+        """回复渲染完成后，若有语法错误的代码块，追加黄色提示（不阻止显示，仅提醒）"""
+        warns = getattr(self, '_code_check_warning', None)
+        if not warns:
+            return
+        parts = '；'.join(f'第{n}个: {m}' for n, m in warns[:3])
+        if len(warns) > 3:
+            parts += f'…（共{len(warns)}处）'
+        warn = QLabel(f'⚠️ 自动检查：上述回复有 {len(warns)} 处 Python 代码块语法错误（{parts}），建议让我重新生成。')
+        warn.setWordWrap(True)
+        warn.setStyleSheet(f'color:{self._tk("ui_warn")}; font-size:11px; background:transparent; padding:2px 0;')
+        self._chat_type_content.addWidget(warn)
+        self._chat_scroll_bottom()
+
+    def _render_md_into(self, content_layout, text):
+        """把 markdown 文本分块渲染进内容区：代码/表格成卡片，连续文本合为一个段落（v6.17）
+        （实现已搬至 pet_bubble.render_md_into；v6.58 把新建控件登记为受主题控件）"""
+        made = pb.render_md_into(content_layout, text, self.theme)
+        for w in made:
+            if isinstance(w, QLabel):
+                self._register_theme_widget(w, 'text', False)
+            else:
+                self._register_theme_widget(w, 'factory', False)   # 卡片：走 apply_theme()
+        return made
+    @staticmethod
+    def _split_rich_blocks(text):
+        """把 markdown 拆成渲染块（拆至 chat_render.split_rich_blocks）
+        （实现已搬至 pet_bubble.split_blocks）"""
+        return pb.split_blocks(text)
+    def _render_one_block(self, content_layout, kind, content):
+        """渲染单个块到内容区（文本/代码卡片/表格卡片）
+        （实现已搬至 pet_bubble.render_one_block）"""
+        return pb.render_one_block(content_layout, kind, content, self.theme)
+    @staticmethod
+    def _md_table_from_text(text):
+        """把纯文本表格块转 HTML（供 _TableCard 使用）
+        （实现已搬至 pet_bubble.md_table_from_text）"""
+        return pb.md_table_from_text(text)
+    def _chat_scroll_bottom(self):
+        """消息流滚动到底部"""
+        sb = self.chat_history_scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _clear_chat_history(self):
+        """清空消息流（保留底部弹簧；占位提示只是移出布局，不销毁）"""
+        hint = getattr(self, 'chat_empty_hint_lbl', None)
+        if hint is not None:
+            try:
+                self.chat_history_layout.removeWidget(hint)
+                hint.hide()
+            except Exception:
+                pass
+        while self.chat_history_layout.count() > 1:
+            item = self.chat_history_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._status_widget = None
+
+    def _update_more_button(self):
+        """有更早历史时显示'显示更多'按钮"""
+        if hasattr(self, 'chat_more_btn'):
+            self.chat_more_btn.setVisible(self._display_offset > 0)
+
+    def _load_more_history(self):
+        """加载更早的显示历史（每次 50 条，插入到面板顶部）"""
+        if self._display_offset <= 0:
+            self._update_more_button()
+            return
+        start = max(0, self._display_offset - 50)
+        chunk = self.display_msgs[start:self._display_offset]
+        self._display_offset = start
+        sb = self.chat_history_scroll.verticalScrollBar()
+        prev = sb.value()
+        new_bubbles = []
+        for m in chunk:
+            ts = m.get('ts', '')
+            who = m.get('who', '桌宠')
+            bubble, content = self._new_bubble_at_top(who, ts, is_user=(who == '我'), text=str(m.get('text', '')))
+            self._render_md_into(content, str(m.get('text', '')))
+            new_bubbles.append(bubble)
+        self._update_more_button()
+        # 保持滚动位置（顶部插入后原内容下移，滚动条值加上新插入高度）
+        added = sum(b.sizeHint().height() for b in new_bubbles) + 8 * len(new_bubbles)
+        sb.setValue(prev + added)
+
+    def _new_bubble_at_top(self, who, ts, is_user=False, text=''):
+        """在消息流顶部插入气泡（历史加载用，v6.19 与 _new_bubble 同构：左右布局+操作按钮）"""
+        self._hide_empty_hint()   # v6.81
+        bubble = QFrame()
+        v = QVBoxLayout(bubble)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        name = QLabel(who)
+        name_color = self.theme.get('name_user') if is_user else self.theme.get('name_ai')
+        name.setStyleSheet(f'color:{name_color};font-size:11px;font-weight:bold;background:transparent;')
+        self._register_theme_widget(name, 'name', is_user)  # v6.58 切主题时名字色同步
+        tl = QLabel(ts)
+        tl.setStyleSheet(f'color:{self._tk("ui_text_muted")};font-size:10px;background:transparent;')
+        if is_user:
+            head.addStretch(1)
+            head.addWidget(name)
+            head.addWidget(tl)
+        else:
+            head.addWidget(name)
+            head.addWidget(tl)
+            head.addStretch(1)
+        if text:
+            cp = QLabel('⧉')
+            cp.setStyleSheet(f'color:{self._tk("ui_text_dim")};font-size:11px;background:transparent;padding:0 2px;')
+            cp.setCursor(Qt.PointingHandCursor)
+            cp.setToolTip('复制该消息')
+            cp.mousePressEvent = lambda e, t=text: self._copy_message_text(t)
+            cp.hide()
+            head.addWidget(cp)
+            sv = QLabel('🖼')
+            sv.setStyleSheet(f'color:{self._tk("ui_text_dim")};font-size:11px;background:transparent;padding:0 2px;')
+            sv.setCursor(Qt.PointingHandCursor)
+            sv.setToolTip('存为图片')
+            sv.mousePressEvent = lambda e, b=bubble: self._save_bubble_image(b)
+            sv.hide()
+            head.addWidget(sv)
+            bubble._action_btns = [cp, sv]
+            bubble.enterEvent = lambda e, b=bubble: [x.show() for x in getattr(b, '_action_btns', [])]
+            bubble.leaveEvent = lambda e, b=bubble: [x.hide() for x in getattr(b, '_action_btns', [])]
+        v.addLayout(head)
+        content = QVBoxLayout()
+        content.setSpacing(4)
+        v.addLayout(content)
+        self.chat_history_layout.insertWidget(0, bubble)
+        return bubble, content
+
+    def _append_chat(self, who, text):
+        """追加一条聊天记录（纯文本路径：系统提示/用户消息，不解析 markdown；多行自动换行）
+        v6.25.1 非主线程调用自动转发主线程——修复 AI 后台线程直接操作 Qt 控件导致的崩溃（Qt6Gui.dll 访问违规）"""
+        text = self._strip_emotion_tags(str(text))[0]  # v6.40 出口统一剥 emotion 标签
+        if threading.current_thread() is not threading.main_thread():
+            self._run_on_ui(lambda w=who, t=text: self._append_chat(w, t))  # v6.58
+            return
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime('%m-%d %H:%M')
+        self.display_msgs.append({'who': who, 'text': str(text), 'ts': ts})
+        if len(self.display_msgs) > 300:
+            self.display_msgs = self.display_msgs[-300:]
+        safe = str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
+        bubble, content = self._new_bubble(who, ts, is_user=(who == '我'), text=str(text))
+        content.addWidget(self._bubble_text_label(safe, is_user=(who == '我')))
+        self._chat_scroll_bottom()
+
+    def _append_chat_md(self, who, text):
+        """追加一条聊天记录（AI 回复用，markdown 分块渲染：代码/表格成卡片）
+        v6.25.1 非主线程调用自动转发主线程（防 Qt 跨线程崩溃）"""
+        if threading.current_thread() is not threading.main_thread():
+            self._run_on_ui(lambda w=who, t=text: self._append_chat_md(w, t))  # v6.58
+            return
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime('%m-%d %H:%M')
+        self.display_msgs.append({'who': who, 'text': str(text), 'ts': ts})
+        if len(self.display_msgs) > 300:
+            self.display_msgs = self.display_msgs[-300:]
+        bubble, content = self._new_bubble(who, ts, is_user=False, text=str(text))
+        self._render_md_into(content, str(text))
+        self._chat_scroll_bottom()
+
+    def _attach_bubble_actions(self, bubble, text):
+        """给消息气泡补复制/存图按钮（hover 显示）。v6.40：流式气泡创建时 text 为空，流式结束后补上"""
+        if not text or getattr(bubble, '_action_btns', None):
+            return
+        v = bubble.layout()
+        if v is None or v.count() == 0:
+            return
+        head = v.itemAt(0).layout()
+        if head is None:
+            return
+        cp = QLabel('⧉')
+        cp.setStyleSheet(f'color:{self._tk("ui_text_dim")};font-size:11px;background:transparent;padding:0 2px;')
+        cp.setCursor(Qt.PointingHandCursor)
+        cp.setToolTip('复制该消息（含图）')
+        cp.mousePressEvent = lambda e, t=text: self._copy_rich_text(t)   # v6.76：升级为富剪贴板（图不丢）
+        cp.hide()
+        head.addWidget(cp)
+        sv = QLabel('🖼')
+        sv.setStyleSheet(f'color:{self._tk("ui_text_dim")};font-size:11px;background:transparent;padding:0 2px;')
+        sv.setCursor(Qt.PointingHandCursor)
+        sv.setToolTip('存为图片')
+        sv.mousePressEvent = lambda e, b=bubble: self._save_bubble_image(b)
+        sv.hide()
+        head.addWidget(sv)
+        bubble._action_btns = [cp, sv]
+        bubble.enterEvent = lambda e, b=bubble: [x.show() for x in getattr(b, '_action_btns', [])]
+        bubble.leaveEvent = lambda e, b=bubble: [x.hide() for x in getattr(b, '_action_btns', [])]
+        bubble._msg_text = text
+        # v6.76：气泡右键菜单（**新增**，hover 那两个按钮保留不动 —— 使用者明确要求保留）
+        for _w in [bubble] + bubble.findChildren(QWidget):
+            try:
+                _w.setContextMenuPolicy(Qt.CustomContextMenu)
+                _w.customContextMenuRequested.connect(
+                    lambda pos, b=bubble, t=text: self._bubble_context_menu(b, t))
+            except Exception as _exc:
+                _silent_log('_attach_bubble_actions:menu', _exc)
+
+    def _bubble_context_menu(self, bubble, text):
+        """气泡右键菜单（v6.76）：朗读选中 / 复制（含图）/ 只复制文字 / 存为图片
+
+        设计取舍：**不替代 hover 按钮**，只是多一个入口（使用者要求保留原交互）。
+        """
+        try:
+            text = str(text or '')
+            sel = ''
+            try:
+                for lb in bubble.findChildren(QLabel):
+                    if lb.hasSelectedText():
+                        sel = lb.selectedText()
+                        break
+                if not sel:
+                    for te in bubble.findChildren(QTextEdit):
+                        c = te.textCursor()
+                        if c and c.hasSelection():
+                            sel = c.selectedText()
+                            break
+            except Exception:
+                sel = sel or ''
+            m = QMenu(self)
+            if sel.strip():
+                m.addAction('🔊 朗读选中', lambda: self._speak_text_now(sel))
+                m.addAction('📋 复制选中', lambda: self._copy_rich_text(sel))
+                m.addSeparator()
+            m.addAction('📋 复制（含图）', lambda: self._copy_rich_text(text))
+            m.addAction('📋 只复制文字', lambda: self._copy_message_text(text))
+            m.addAction('🖼 存为图片', lambda: self._save_bubble_image(bubble))
+            m.addAction('🔊 朗读这条（按当前策略）', lambda: self._speak_text_now(text))
+            m.exec(QCursor.pos())
+        except Exception as _exc:
+            _silent_log('_bubble_context_menu', _exc)
+
+    def _speak_text_now(self, text):
+        """朗读指定文本（用户主动 → force=True，忽略开关与夜间静音）"""
+        try:
+            v = getattr(self, 'voice', None)
+            if v is None:
+                return False
+            if v.speak(str(text or ''), force=True):
+                self._notify('🔊 正在朗读')
+                return True
+            self._notify('没能出声（看日志里的原因）')
+        except Exception as _exc:
+            _silent_log('_speak_text_now', _exc)
+        return False
+
+    def _copy_rich_text(self, text):
+        """复制为**富剪贴板**（v6.76）：text/plain + text/html，其中本地图片内联成 data URI
+
+        为什么：原先的复制只写纯文本 → 粘到 Word/飞书/微信**图片会丢**（使用者反馈）。
+        取舍：单条消息图片总量限 `MAX_IMG_BYTES`；超限就把那张图降级为原链接并提示一句，
+        **绝不静默丢图**；远程图片保留链接（不联网下载、不膖胀）。
+        """
+        import base64
+        import re as _re
+        from PySide6.QtCore import QMimeData
+        MAX_IMG_BYTES = 8 * 1024 * 1024
+        text = str(text or '')
+        try:
+            blocks = self._split_rich_blocks(text)
+            parts, img_bytes, degraded = [], 0, 0
+            for kind, content in blocks:
+                if kind == 'code':
+                    esc = (content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+                    parts.append('<pre style="font-family:Consolas,monospace;white-space:pre-wrap">%s</pre>'
+                                 % esc)
+                elif kind == 'table':
+                    parts.append(self._md_table_from_text(content))
+                else:
+                    parts.append(self._md_to_html(content))
+            html_body = ''.join(parts)
+
+            def _inline(m):
+                nonlocal img_bytes, degraded
+                src = m.group(1)
+                if src.startswith(('data:', 'http://', 'https://')):
+                    return m.group(0)                      # 远程/已内联：不动
+                p = src if os.path.isabs(src) else os.path.join(BASE_DIR, src)
+                if not os.path.isfile(p):
+                    return m.group(0)
+                try:
+                    raw = open(p, 'rb').read()
+                except Exception:
+                    return m.group(0)
+                if img_bytes + len(raw) > MAX_IMG_BYTES:
+                    degraded += 1
+                    return m.group(0)                      # 超限：保留原路径（降级不丢）
+                img_bytes += len(raw)
+                ext = os.path.splitext(p)[1].lower().lstrip('.')
+                mime = {'jpg': 'jpeg', 'jpeg': 'jpeg', 'png': 'png', 'gif': 'gif',
+                        'webp': 'webp', 'bmp': 'bmp'}.get(ext, 'png')
+                b64 = base64.b64encode(raw).decode('ascii')
+                return m.group(0).replace(src, 'data:image/%s;base64,%s' % (mime, b64))
+
+            html_body = _re.sub(r'src="([^"]+)"', _inline, html_body)
+            mime = QMimeData()
+            mime.setText(text)
+            mime.setHtml('<div style="font-size:13px;line-height:1.7">%s</div>' % html_body)
+            QApplication.clipboard().setMimeData(mime)
+            if degraded:
+                self.say_plain('⚠️ 已复制（有 %d 张图超过 %d MB 上限，保留为原链接）'
+                               % (degraded, MAX_IMG_BYTES // 1048576), immediate=True)
+            else:
+                self.say_plain('✅ 已复制（含图 %d KB）' % (img_bytes // 1024)
+                               if img_bytes else '✅ 已复制', immediate=True)
+            return True
+        except Exception as _exc:
+            _silent_log('_copy_rich_text', _exc)
+            try:
+                return self._copy_message_text(text)   # 兑底：至少把文字复制过去
+            except Exception:
+                return False
+
+    @staticmethod
+    def _md_to_html(text):
+        """轻量 Markdown → HTML（拆至 chat_render.md_to_html）
+        （实现已搬至 pet_bubble.to_html）"""
+        return pb.to_html(text)
+    @staticmethod
+    def _md_table(m):
+        """Markdown 表格块 → HTML table（拆至 chat_render.md_table）
+        （实现已搬至 pet_bubble.to_table_html）"""
+        return pb.to_table_html(m)
+    def _remove_status_line(self):
+        """删除状态行 widget（⏳/思考中）"""
+        if self._status_widget is not None:
+            try:
+                self.chat_history_layout.removeWidget(self._status_widget)
+                self._status_widget.deleteLater()
+            except Exception:
+                pass
+            self._status_widget = None
+            return True
+        return False
+
+    def _update_ai_status(self, text):
+        """更新 AI 处理状态（删旧状态行 + 追加新状态行，不残留）"""
+        self._remove_status_line()
+        self._status_widget = QLabel(f'⏳ {text}')
+        self._status_widget.setWordWrap(True)
+        self._status_widget.setStyleSheet(
+            f'color:{self._tk("ui_text_dim")}; font-size:11px; background:transparent; padding:2px 0;')
+        self.chat_history_layout.insertWidget(self.chat_history_layout.count() - 1, self._status_widget)
+        self._chat_scroll_bottom()
+
+    def _panel_qss(self):
+        """按当前主题变量生成聊天面板样式（v6.23 主题系统）"""
+        t = self.theme
+        return f"""
+            QFrame {{ background-color: {t['panel_bg']}; border-radius: 12px; }}
+            QTextBrowser {{ background: transparent; color: {t['text']}; border: none; font-size: 12px; padding: 6px; }}
+            QTextEdit {{ background: {t['input_bg']}; color: {t.get('input_text') or DEFAULT_THEME['input_text']}; border: none; border-radius: 8px; padding: 6px 10px; font-size: 12px; }}
+            QTextEdit:focus {{ background: {t['input_focus']}; }}
+            QTextEdit viewport {{ background: transparent; }}
+            QScrollArea {{ background: transparent; border: none; }}
+            #chatHistoryBox, #chatHistoryViewport {{ background: transparent; }}
+            QScrollBar:vertical {{ background: {t['scroll_bg']}; width: 8px; border-radius: 4px; margin: 0; }}
+            QScrollBar::handle:vertical {{ background: {t['scroll_handle']}; border-radius: 4px; min-height: 20px; }}
+            QScrollBar::handle:vertical:hover {{ background: {t['scroll_handle_hover']}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """
+
+    def _set_theme_data(self, tname):
+        """只更新主题数据（不碰 GUI）——可在后台线程调用，与 apply_theme_named 共用"""
+        self.current_theme = tname
+        self.theme = dict(DEFAULT_THEME)
+        if tname != 'default':
+            self.theme.update(self.plugin_mgr.theme_vars(tname))
+
+    def apply_theme_named(self, tname):
+        """切换主题（右键菜单「形象 → 主题」入口；AI 工具 set_theme 共用数据逻辑）。
+
+        v6.51：此前只有 AI 工具能切主题，右键菜单与设置窗口都没入口——装了主题插件的
+        用户自己反而用不上。这里补上入口，并让气泡一起跟随主题。
+        """
+        try:
+            available = ['default'] + [str(x) for x in self.plugin_mgr.theme_names()]
+        except Exception:
+            available = ['default']
+        if tname not in available:
+            return False
+        self._set_theme_data(tname)
+        self._apply_theme()
+        self._save_cfg_value('theme', tname)
+        self.say_plain(('已切换主题：%s' % tname) if tname != 'default' else '已切回默认主题')
+        return True
+
+    def _apply_bubble_theme(self):
+        """说话气泡跟随主题（v6.51）：颜色取自主题，缺键时回退原来的浅色外观
+        （实现已搬至 pet_bubble.apply_say_bubble_theme）"""
+        try:
+            pb.apply_say_bubble_theme(self.bubble, self.theme, self._bubble_mode)  # v6.60 批3：关心模式跟随
+        except Exception as e:
+            log.debug('气泡主题应用失败：%s', e)
+    def _apply_theme(self):
+        """把当前主题应用到面板、说话气泡与已有消息
+
+        v6.25.1 必须主线程调用（修复 AI 后台线程跨线程 setStyleSheet 崩溃）；
+        v6.58 追加 _retheme_messages()：切主题时把已有消息气泡一起刷新。"""
+        try:
+            self.chat_panel.setStyleSheet(self._panel_qss())
+        except Exception as e:
+            log.warning('主题样式应用失败：%s', e)
+        self._apply_bubble_theme()
+        self._apply_cloud_theme()   # v6.77：云朵提示框同步换色
+        self._style_status_bar()   # v6.60 批 2：状态条同步换色
+        self._retheme_messages()   # v6.58：历史消息气泡同步换色
+        self._publish_theme()  # v6.58：发布给所有订阅模块（小游戏等）
+
+    def _publish_theme(self):
+        """把当前生效主题发布给所有订阅模块（小游戏 / 卡片 / 关系面板 …；v6.58 A2-2）
+
+        实现：pet_theme.set_active() 更新全局生效主题并通知订阅者 —— 各 UI 模块
+        只需在导入时 pet_theme.subscribe(自己的重刷函数)，不再各自维护一份主题拷贝。"""
+        try:
+            pet_theme.set_active(self.theme)
+        except Exception as e:
+            log.debug('主题发布失败：%s', e)
+
+    # ---------- v6.58 主题生效链路（修"AI 装了主题却不生效"） ----------
+    def _run_on_ui(self, fn):
+        """把 GUI 操作安全投递到主线程执行。
+
+        背景：此前用 `QTimer.singleShot(0, fn)` 从工作线程"回主线程"，但 QTimer 需要目标
+        线程有事件循环——AI 工具是在工作线程（Thread）里跑的，那里没有事件循环，定时器
+        **永不触发**。表现：AI 装了主题插件、config 也写了，界面却毫无变化。
+        这里改用跨线程信号（项目既有做法，见 ai_reply_signal / confirm_signal）。
+        """
+        if threading.current_thread() is threading.main_thread():
+            try:
+                fn()
+            except Exception as e:
+                log.warning('主线程执行失败：%s', e)
+            return
+        self.ui_call_signal.emit(fn)
+
+    def _tk(self, key):
+        """取当前主题色（v6.58 宿主侧唯一入口；缺键回退 pet_theme 默认值）"""
+        return self.theme.get(key) or DEFAULT_THEME.get(key) or '#ff00ff'  # theme-exempt（缺键兜底色）
+
+    def _set_themed_qss(self, w, factory):
+        """给控件挂"按主题生成样式"的工厂：切主题时由 _retheme_messages() 统一重刷（v6.58）"""
+        try:
+            w._theme_qss = factory
+            w.setStyleSheet(factory())
+        except Exception as e:
+            log.debug('主题化控件失败：%s', e)
+        self._register_theme_widget(w, 'factory', False)
+        return w
+
+    def _restore_saved_theme(self):
+        """启动时恢复 config 里保存的主题（v6.58：此前 theme 只写不读，重启即被重置为 default）"""
+        tname = str(getattr(self, '_saved_theme', 'default') or 'default')
+        if tname == 'default':
+            return
+        try:
+            available = ['default'] + [str(x) for x in self.plugin_mgr.theme_names()]
+            if tname not in available:
+                log.warning('启动恢复主题跳过：「%s」不在可用列表 %s', tname, available)
+                return
+            self._set_theme_data(tname)
+            self._apply_theme()
+            log.info('已恢复上次主题：%s', tname)
+        except Exception as e:
+            log.warning('启动恢复主题失败：%s', e)
+
+    def _register_theme_widget(self, w, kind, is_user):
+        """登记一个受主题着色影响的控件（kind='name'|"text'），切主题时统一刷新（v6.58）"""
+        try:
+            self._theme_widgets.append((w, kind, is_user))
+        except Exception:
+            pass
+
+    def _retheme_messages(self):
+        """切主题时刷新已有消息气泡（名字色 + 文本底色）；已销毁控件自动剔除（v6.58）"""
+        alive = []
+        for w, kind, is_user in list(getattr(self, '_theme_widgets', [])):
+            try:
+                if kind == 'name':
+                    c = self.theme.get('name_user') if is_user else self.theme.get('name_ai')
+                    w.setStyleSheet(f'color:{c};font-size:11px;font-weight:bold;background:transparent;')
+                elif kind == 'factory':
+                    if hasattr(w, 'apply_theme'):
+                        w.apply_theme()          # 卡片等自带 apply_theme 的控件
+                    else:
+                        fn = getattr(w, '_theme_qss', None)
+                        if callable(fn):
+                            w.setStyleSheet(fn())
+                else:
+                    pb.apply_message_label_theme(w, self.theme, is_user)
+                alive.append((w, kind, is_user))
+            except RuntimeError:
+                continue          # Qt 对象已销毁
+            except Exception:
+                continue
+        self._theme_widgets = alive
+
+    # ---------- v6.81：人物大小 / 透明度（可调） ----------
+    PET_SIZE_MIN = 140          # 再小就看不清表情了
+    PET_SIZE_MAX = 400          # 再大会顶到面板两侧（面板宽 420）
+    PET_SIZE_DEFAULT = 260
+    PET_OPACITY_MIN = 0.3       # 低于 30% 基本等于“宠物消失”，容易找不回来
+
+    def _pet_band_h(self):
+        """立绘区高度 = 立绘 + 底部空隙 60（窗口高 = 面板高 + 这个值）"""
+        return int(getattr(self, 'pet_size', self.PET_SIZE_DEFAULT)) + 60
+
+    def _clamp_pet_size(self, v):
+        """大小归一：非数字/越界一律夹到合理区间"""
+        try:
+            v = int(round(float(v)))
+        except (TypeError, ValueError):
+            return self.PET_SIZE_DEFAULT
+        return max(self.PET_SIZE_MIN, min(self.PET_SIZE_MAX, v))
+
+    def _clamp_pet_opacity(self, v):
+        """透明度归一：0~2 当比例（1.4 视为“过量”→ 夹到 1.0），>2 当百分比，最终夹到 0.3~1.0"""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return 1.0
+        if v > 2.0:
+            v = v / 100.0
+        return max(self.PET_OPACITY_MIN, min(1.0, v))
+
+    def _read_appearance_cfg(self):
+        """读 pet_size / pet_opacity（config.json 缺字段时用出厂值）"""
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                cfg = json.load(f) or {}
+            self.pet_size = self._clamp_pet_size(cfg.get('pet_size', self.PET_SIZE_DEFAULT))
+            self.pet_opacity = self._clamp_pet_opacity(cfg.get('pet_opacity', 1.0))
+        except Exception as _exc:
+            _silent_log('_read_appearance_cfg', _exc)
+
+    def _apply_pet_size(self, size, save=True, keep_bottom=True):
+        """调整立绘大小（同步窗口尺寸；底边中点保持不动，免得宠物突然跳走）"""
+        size = self._clamp_pet_size(size)
+        old = int(getattr(self, 'pet_size', self.PET_SIZE_DEFAULT))
+        self.pet_size = size
+        try:
+            already = self.pet_label.width() == size
+        except Exception:
+            already = False
+        if size == old and already:
+            if save:
+                self._save_cfg_value('pet_size', size)
+            return size
+        self._scaled_cache = {}          # 尺寸变了，缩放缓存作废
+        try:
+            self.pet_label.setFixedSize(size, size)
+        except Exception as _exc:
+            _silent_log('_apply_pet_size:label', _exc)
+        try:
+            if getattr(self, '_l2d_widget', None) is not None:
+                self._l2d_widget.setFixedSize(size, size)
+        except Exception as _exc:
+            _silent_log('_apply_pet_size:l2d', _exc)
+        cx = self.x() + self.width() // 2
+        bottom = self.y() + self.height()
+        self._sync_window_to_panel()
+        if keep_bottom:
+            self.move(cx - self.width() // 2, bottom - self.height())
+            self.base_x, self.base_y = self.x(), self.y()
+        # v6.81 关键：按新尺寸**立刻重画**。原先只改了 QLabel 尺寸和窗口，
+        # QLabel 里还是旧尺寸那张 pixmap（变大→人没变大只多出一圈空白；变小→人被裁掉），
+        # 看着就像“人物没有跟着等比例缩放”。
+        try:
+            if getattr(self, '_edge_side', None) is not None:
+                self._restore_display_state()          # 贴边/扒边：走它自己的绘制路径
+            else:
+                src = getattr(self, '_last_render_src', None)
+                if src is not None and not src.isNull():
+                    self._render_frame(src)            # 原地重画当前这一帧（情绪/场景图也保住）
+                else:
+                    self._show_idle()
+        except Exception as _exc:
+            _silent_log('_apply_pet_size:render', _exc)
+        if save:
+            self._save_cfg_value('pet_size', size)
+        return size
+
+    def _apply_pet_opacity(self, alpha, save=True):
+        """调整人物透明度（只影响立绘，不碰聊天面板/气泡/状态条）"""
+        alpha = self._clamp_pet_opacity(alpha)
+        self.pet_opacity = alpha
+        try:
+            if alpha >= 0.999:
+                # 100% 时不用 effect：省一次离屏合成，也避免个别显卡上的发虚
+                self.pet_stack.setGraphicsEffect(None)
+            else:
+                eff = getattr(self, '_pet_opacity_effect', None)
+                if eff is None:
+                    eff = QGraphicsOpacityEffect(self.pet_stack)
+                    self._pet_opacity_effect = eff
+                eff.setOpacity(alpha)
+                if self.pet_stack.graphicsEffect() is not eff:
+                    self.pet_stack.setGraphicsEffect(eff)
+        except Exception as _exc:
+            _silent_log('_apply_pet_opacity', _exc)
+        if save:
+            self._save_cfg_value('pet_opacity', round(alpha, 3))
+        return alpha
+
+    def wheelEvent(self, event):
+        """v6.81：Ctrl+滚轮缩放人物（普通滚轮不动，交回默认处理）"""
+        try:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                step = 20 if event.angleDelta().y() > 0 else -20
+                self._apply_pet_size(int(getattr(self, 'pet_size', self.PET_SIZE_DEFAULT)) + step)
+                event.accept()
+                return
+        except Exception as _exc:
+            _silent_log('wheelEvent:pet_size', _exc)
+        super().wheelEvent(event)
+
+    # ---------- v6.82：音乐（MusicFree 插件当音源 + mpv 播放 + 头顶歌词） ----------
+    def open_music_panel(self):
+        """打开音乐面板
+
+        懒创建：第一次点「🎵 音乐…」才启动 Node 插件宿主和 mpv，平时一点开销都没有。
+        环境不满足（没装 Node / musicfree/plugins 是空的）时给一句能照做的提示，
+        而不是丢一个堆栈给用户。
+        """
+        try:
+            if getattr(self, '_music', None) is None:
+                import pet_music_ui
+                if not pet_music_ui.free_bridge.PluginHost.available():
+                    hint = ('🎵 音乐还差点东西：需要 Node.js，并且 musicfree/plugins 里至少有一个插件\n'
+                            '（插件从 github.com/maotoumao/MusicFreePlugins 下载 .js 丢进去即可）')
+                    self._notify(hint)
+                    self.say_plain('音乐功能还没装好呢', immediate=True)
+                    return None
+                self._music = pet_music_ui.MusicController(self)
+                self._music.notice.connect(lambda t: self._notify(t))
+            return self._music.panel()
+        except Exception as _exc:
+            _silent_log('open_music_panel', _exc)
+            self._notify('🎵 音乐面板打不开：%s' % _exc)
+            return None
+
+    # ---------- v6.85：一键下载（yt-dlp 内核） ----------
+    def open_download_panel(self):
+        """打开下载面板
+
+        懒创建：第一次点「⬇」才去找 yt-dlp/ffmpeg、才接剪贴板监听，平时一点开销都没有。
+        缺东西（没装 yt-dlp 或 ffmpeg）时给一句能照做的提示，而不是丢一堆报错。
+        """
+        try:
+            if getattr(self, '_download', None) is None:
+                import pet_download_ui
+                self._download = pet_download_ui.DownloadController(self)
+                self._download.notice.connect(lambda t: self._notify(t))
+            return self._download.panel()
+        except Exception as _exc:
+            _silent_log('open_download_panel', _exc)
+            self._notify('🎬 下载面板打不开：%s' % _exc)
+            return None
+
+    # ---------- v6.86：文件转换（Filee CLI + 内置引擎） ----------
+    def open_convert_panel(self, files=None):
+        """打开文件转换面板
+
+        `files` 给了就直接塞进列表（拖文件到桌宠身上走的就是这条路）。
+        懒创建：第一次点「⇄」才去找 Filee、才算可用格式，平时零开销。
+        """
+        try:
+            if getattr(self, '_convert', None) is None:
+                import pet_convert_ui
+                self._convert = pet_convert_ui.ConvertController(self)
+                self._convert.notice.connect(lambda t: self._notify(t))
+            return self._convert.panel(files)
+        except Exception as _exc:
+            _silent_log('open_convert_panel', _exc)
+            self._notify('⇄ 转换面板打不开：%s' % _exc)
+            return None
+
+    # ---------- v6.88：见面照片墙（每次见面 = 一面拍立得墙） ----------
+    def _photo_controller(self):
+        """懒创建照片墙控制器（第一次点 📷 才读 meetings.json，平时零开销）"""
+        if getattr(self, '_photos', None) is None:
+            import pet_photos_ui
+            self._photos = pet_photos_ui.PhotoController(self)
+            self._photos.notice.connect(lambda t: self._notify(t))
+            self._photos.on_meetings = self._record_meetings   # 新见面 → 写回忆 + 加好感
+        return self._photos
+
+    def open_photo_wall(self, files=None):
+        """打开见面照片墙（`files` 给了就直接导入，拖照片到桌宠身上走这条路）"""
+        try:
+            ctrl = self._photo_controller()
+            return ctrl.panel(files)
+        except Exception as _exc:
+            _silent_log('open_photo_wall', _exc)
+            self._notify('📷 照片墙打不开：%s' % _exc)
+            return None
+
+    def open_photo_card(self):
+        """桌宠旁边的见面小卡片（最近的照片 + 下次见面倒计时）"""
+        try:
+            return self._photo_controller().card()
+        except Exception as _exc:
+            _silent_log('open_photo_card', _exc)
+            self._notify('📷 见面卡片打不开：%s' % _exc)
+            return None
+
+    # ---------- v6.95：异地（两城天气 + 直线距离 + 突变提醒） ----------
+    def _long_distance(self):
+        """懒创建异地数据层（城市/天气缓存与提醒去重都在里面）"""
+        if getattr(self, '_ld_svc', None) is None:
+            import pet_long_distance
+            self._ld_svc = pet_long_distance.LongDistance()
+        return self._ld_svc
+
+    def open_long_distance(self):
+        """右键「异地…」：我的地点 / TA 的地点 / 天气 / 直线距离"""
+        try:
+            dlg = getattr(self, '_ld_dialog', None)
+            if dlg is None:
+                import pet_long_distance_ui
+                self._ld_dialog = pet_long_distance_ui.LongDistanceDialog(self)
+            self._ld_dialog.show()
+            self._ld_dialog.raise_()
+            self._ld_dialog.activateWindow()
+            return self._ld_dialog
+        except Exception as _exc:
+            _silent_log('open_long_distance', _exc)
+            self._notify('🌤 异地面板打不开：%s' % _exc)
+            return None
+
+    def _check_long_distance_weather(self):
+        """TA 城市天气突变检查（后台取数；同一天同类只提醒一次）"""
+        cfg = getattr(self, '_cfg', {}) or {}
+        ta_city = str(cfg.get('ld_city') or '').strip()
+        if not ta_city or not bool(cfg.get('ld_alert', True)):
+            return
+        if self.sleeping or self._is_night() or getattr(self, '_ld_busy', False):
+            return
+        self._ld_busy = True
+
+        def work():
+            text = ''
+            try:
+                text = self._long_distance().pop_alert(ta_city)
+            except Exception as exc:
+                log.debug('异地天气检查失败：%s', exc)
+            finally:
+                self._ld_busy = False
+            if text:
+                self._run_on_ui(lambda: self._announce_long_distance(text))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _announce_long_distance(self, text):
+        """天气突变提醒：能看到桌宠就冒气泡，收在托盘就发系统通知"""
+        self.say_plain(text, immediate=True)
+        try:
+            if not self.isVisible() and getattr(self, 'tray', None):
+                self.tray.showMessage('天气提醒', text, QSystemTrayIcon.Information, 8000)
+        except Exception as exc:
+            log.debug('天气托盘通知失败：%s', exc)
+
+    # ---------- v6.89：记账（说一句「午饭 32」就记一笔） ----------
+    def _ledger_controller(self):
+        """懒创建记账控制器（第一次用才读 ledger.json，平时零开销）"""
+        if getattr(self, '_ledger', None) is None:
+            import pet_ledger_ui
+            self._ledger = pet_ledger_ui.LedgerController(self)
+            self._ledger.notice.connect(lambda t: self._notify(t))
+            self._ledger.changed.connect(self._on_ledger_changed)
+        return self._ledger
+
+    def open_ledger(self):
+        """打开账本面板（标题栏 ¥ / 右键「¥ 记账…」都走这里）"""
+        try:
+            return self._ledger_controller().show_panel(self)
+        except Exception as _exc:
+            _silent_log('open_ledger', _exc)
+            self._notify('¥ 记账面板打不开：%s' % _exc)
+            return None
+
+    def _on_ledger_changed(self):
+        """账本变了 → 侧栏页签跟着刷（面板自己会刷自己，不用管）"""
+        try:
+            self.side_panel.refresh_dynamic(force=True)
+        except Exception:
+            pass
+
+    def _ledger_remind(self, entry, month=None):
+        """超预算时头顶轻提醒（拍板 4A：不弹窗、不写聊天列表；同一分类一天只唠叨一次）"""
+        try:
+            ctrl = self._ledger_controller()
+            month = month or str((entry or {}).get('date', ''))[:7]
+            line = ctrl.check_budget(month)
+            if not line:
+                return
+            day = time.strftime('%Y-%m-%d')
+            seen = getattr(self, '_lg_remind', None)
+            if not isinstance(seen, dict):
+                seen = {}
+            key = day + '|' + line[:16]
+            if key in seen:
+                return
+            seen[key] = True
+            self._lg_remind = {k: v for k, v in seen.items() if k.startswith(day)}   # 只留今天
+            self.say_care('💸 ' + line, kind='remind')
+        except Exception as _exc:
+            _silent_log('ledger_remind', _exc)
+
+    def _tool_ledger(self, args):
+        """AI 工具：记账（add / list / summary / budget / edit / delete）
+
+        3A 的落地：**先本地解析** —— 「午饭 32」本地就认得（零 token、离线也能记），
+        模型只要把用户原话塞进 text 就行；本地认不出金额时才用模型给的 amount/cat 兜底。
+        模型显式给了 date/amount/cat 等字段时以模型为准（比如它看出「袜子」该算日用）。
+        """
+        try:
+            import pet_ledger as _lg
+            ctrl = self._ledger_controller()
+            book = ctrl.book
+        except Exception as e:
+            return '记账不可用：%s' % e
+        args = args or {}
+        action = str(args.get('action') or 'add').lower()
+        month = _lg.norm_month(args.get('month')) if args.get('month') else _lg.today_str()[:7]
+        text = str(args.get('text') or '').strip()
+
+        # ---- 记一笔
+        if action == 'add':
+            r = None
+            if text:
+                parsed = _lg.parse_entry(text, cats=book.cats())
+                if parsed.get('ok'):
+                    r = parsed
+            if r is None:
+                amt = args.get('amount')
+                if amt in (None, '', 0):
+                    return ('这笔没记上：没认出金额。可以让使用者说个数字（「午饭 32」），'
+                            '或者你先问一句花了多少')
+                r = {'date': _lg.today_str(), 'amount': amt, 'kind': args.get('kind') or 'expense',
+                     'cat': args.get('cat') or '其他', 'account': args.get('account') or '',
+                     'note': args.get('note') or text[:60]}
+            # 模型显式给的字段覆盖本地猜测
+            for k in ('amount', 'kind', 'cat', 'account', 'note'):
+                if args.get(k) not in (None, ''):
+                    r[k] = args[k]
+            if args.get('date'):
+                d = _lg.norm_date(args.get('date'))
+                if d:
+                    r['date'] = d
+            e = ctrl.add_entry(r, src='chat')
+            if not e:
+                return '这笔没记上（金额不合规）'
+            self._ledger_remind(e, str(e.get('date', ''))[:7])
+            return '已记账：' + _lg.line_for_user(e) + ctrl.budget_tail(e)
+
+        # ---- 查账
+        if action == 'list':
+            rows = book.entries(month, kind=(args.get('kind') or None),
+                                cat=(args.get('cat') or None), query=text)
+            if not rows:
+                return '%s还没有记账' % _lg.month_label(month)
+            lines = [book.summary_line(month)]
+            for e in rows[:20]:
+                lines.append('· %s %s%s %s%s [%s]' % (
+                    str(e.get('date', ''))[5:], _lg.kind_label(e.get('kind')),
+                    _lg.fmt_amount(e.get('amount')), e.get('cat', ''),
+                    ('·' + str(e.get('note'))) if e.get('note') else '', e.get('id', '')))
+            if len(rows) > 20:
+                lines.append('…还有 %d 笔（要看得细就开账本面板）' % (len(rows) - 20))
+            return '\n'.join(lines)
+
+        # ---- 月度汇总
+        if action == 'summary':
+            return book.summary_line(month) + '\n' + book.budget_line(month)
+
+        # ---- 预算：给了 cat + amount 就是设限额，否则报余额
+        if action == 'budget':
+            cat = str(args.get('cat') or '').strip()
+            if cat and args.get('amount') not in (None, ''):
+                try:
+                    book.set_budget(cat, args.get('amount'))
+                except Exception as exc:
+                    return '设预算失败：%s' % exc
+                self._on_ledger_changed()
+                return '已把「%s」的月度预算设成 %s' % (cat, _lg.fmt_amount(args.get('amount')))
+            states = book.budget_state(month)
+            if not states:
+                return '还没设预算。可以按分类设：比如「餐饮每月预算 1500」'
+            lines = ['%s 预算：' % _lg.month_label(month)]
+            for b in states:
+                if b['over']:
+                    lines.append('· %s：花 %s / 上限 %s（超了 %s）' % (
+                        b['cat'], _lg.fmt_amount(b['spent']), _lg.fmt_amount(b['limit']),
+                        _lg.fmt_amount(-b['left'])))
+                else:
+                    lines.append('· %s：花 %s / 上限 %s（剩 %s，%d%%）' % (
+                        b['cat'], _lg.fmt_amount(b['spent']), _lg.fmt_amount(b['limit']),
+                        _lg.fmt_amount(b['left']), int(b['pct'])))
+            return '\n'.join(lines)
+
+        # ---- 改 / 删
+        if action in ('edit', 'delete'):
+            eid = str(args.get('id') or '').strip()
+            if not eid:
+                rows = book.entries(month)
+                if not rows:
+                    return '没有可以%s的账目' % ('改' if action == 'edit' else '删')
+                eid = str(rows[0].get('id') or '')          # 没给 id 就动最近那一笔
+            old = book.get(eid)
+            if not old:
+                return '没找到这一笔（id 不对？先用 action=list 看一眼）'
+            if action == 'delete':
+                ctrl.delete_entry(eid)
+                return '已删掉：%s %s%s %s' % (
+                    str(old.get('date', ''))[5:], _lg.kind_label(old.get('kind')),
+                    _lg.fmt_amount(old.get('amount')), old.get('cat', ''))
+            fields = {k: args[k] for k in ('amount', 'kind', 'cat', 'account', 'note')
+                      if args.get(k) not in (None, '')}
+            if args.get('date'):
+                d = _lg.norm_date(args.get('date'))
+                if d:
+                    fields['date'] = d
+            e = ctrl.update_entry(eid, fields)
+            if not e:
+                return '这一笔没改成（金额不合规？）'
+            return '已改：' + _lg.line_for_user(e)
+
+        return '不认识的 action=%s（可用：add / list / summary / budget / edit / delete）' % action
+
+    def _record_meetings(self, mids, lib=None):
+        """把新记录的见面写进回忆日志（type='meeting'），并按配置加一点好感度
+
+        这样「回忆相册」里能看到「2026-10-21 · 那次见面」，system prompt 也会带上一句，
+        桌宠下次就能主动提起（跟 v6.30 的事件记忆一条链）。
+        """
+        role = self.current
+        try:
+            import pet_photos as _ph
+        except Exception:
+            return
+        if lib is None:
+            try:
+                lib = self._photo_controller().lib
+            except Exception:
+                return
+        enabled = True
+        try:
+            enabled = _ph.cfg_bool(_ph.CFG_XP, True)
+        except Exception:
+            enabled = True
+        for mid in (mids or []):
+            try:
+                m = lib.get(mid) or {}
+                photos = _ph.meeting_photos(m)
+                if not photos:
+                    continue
+                date = str(m.get('date') or '')
+                title = str(m.get('title') or '') or (date + ' 的见面')
+                detail_bits = []
+                if m.get('place'):
+                    detail_bits.append(str(m['place']))
+                if m.get('mood'):
+                    detail_bits.append('心情：%s' % m['mood'])
+                if m.get('note'):
+                    detail_bits.append(str(m['note']))
+                detail_bits.append('%d 张照片' % len(photos))
+                aff = None
+                try:
+                    aff = self.affection.snapshot(role)['affection']
+                except Exception:
+                    aff = None
+                self.memories.add(role, 'meeting', '见面：%s · %s' % (_ph.pretty_date(date), title),
+                                  '，'.join(detail_bits), affection_at=aff)
+                if enabled:
+                    self.affection.trigger(role, 'meeting')
+            except Exception as _exc:
+                _silent_log('_record_meetings', _exc)
+
+    def _open_appearance_dialog(self):
+        """🎨 大小与透明度调节面板（非模态 + 拖动即时生效，方便边看边调）"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        dlg = QDialog(self)
+        dlg.setWindowTitle('🎨 人物大小 / 透明度' if not is_en else '🎨 Pet size / opacity')
+        pwin.add_hide_button(dlg)       # v6.90：标题栏「—」隐藏键
+        dlg.setStyleSheet(
+            'QDialog{background:%s;}'
+            'QLabel{color:%s;font-size:12px;background:transparent;}'
+            'QSlider::groove:horizontal{height:6px;border-radius:3px;background:%s;}'
+            'QSlider::handle:horizontal{width:14px;margin:-5px 0;border-radius:7px;background:%s;}'
+            'QPushButton{background:%s;color:%s;border:none;border-radius:6px;padding:5px 10px;font-size:12px;}'
+            'QPushButton:hover{background:%s;}'
+            % (self._solid(self._tk('ui_popup_bg')), self._tk('ui_text'),
+               self._solid(self._tk('ui_popup_list_bg')), self._tk('accent'),
+               self._solid(self._tk('ui_popup_btn_bg')), self._tk('ui_text_soft'),
+               self._solid(self._tk('ui_popup_btn_hover'))))
+        dlg.setFixedWidth(320)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel('大小' if not is_en else 'Size'))
+        s1 = QSlider(Qt.Horizontal)
+        s1.setRange(self.PET_SIZE_MIN, self.PET_SIZE_MAX)
+        s1.setSingleStep(10)
+        s1.setPageStep(20)
+        s1.setValue(int(getattr(self, 'pet_size', self.PET_SIZE_DEFAULT)))
+        v1 = QLabel('%d px' % s1.value())
+        v1.setFixedWidth(56)
+        row1.addWidget(s1, 1)
+        row1.addWidget(v1)
+        lay.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel('透明度' if not is_en else 'Opacity'))
+        s2 = QSlider(Qt.Horizontal)
+        s2.setRange(int(self.PET_OPACITY_MIN * 100), 100)
+        s2.setSingleStep(5)
+        s2.setValue(int(round(getattr(self, 'pet_opacity', 1.0) * 100)))
+        v2 = QLabel('%d%%' % s2.value())
+        v2.setFixedWidth(56)
+        row2.addWidget(s2, 1)
+        row2.addWidget(v2)
+        lay.addLayout(row2)
+
+        # 拖动即生效（不点确定，所见即所得）
+        s1.valueChanged.connect(lambda v: (self._apply_pet_size(v), v1.setText('%d px' % v)))
+        s2.valueChanged.connect(lambda v: (self._apply_pet_opacity(v / 100.0), v2.setText('%d%%' % v)))
+
+        row3 = QHBoxLayout()
+        row3.setSpacing(6)
+        for label, px in ((('小' if not is_en else 'S'), 190),
+                          (('中' if not is_en else 'M'), 260),
+                          (('大' if not is_en else 'L'), 340)):
+            b = QPushButton(label)
+            b.clicked.connect(lambda checked=False, p=px: s1.setValue(p))
+            row3.addWidget(b)
+        row3.addStretch(1)
+        reset = QPushButton('恢复默认' if not is_en else 'Reset')
+        reset.clicked.connect(lambda: (s1.setValue(self.PET_SIZE_DEFAULT), s2.setValue(100)))
+        row3.addWidget(reset)
+        lay.addLayout(row3)
+
+        hint = QLabel('拖动滑块即时生效；在人物上按住 Ctrl 滚轮也能缩放'
+                      if not is_en else
+                      'Sliders apply live; hold Ctrl and scroll over the pet to zoom')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('color:%s;font-size:11px;background:transparent;' % self._tk('ui_text_dim'))
+        lay.addWidget(hint)
+
+        # 摆到宠物左侧，别挡住立绘
+        try:
+            dlg.adjustSize()
+            scr = self.screen() or QApplication.primaryScreen()
+            avail = scr.availableGeometry()
+            x = self.x() - dlg.width() - 12
+            if x < avail.left():
+                x = min(avail.right() - dlg.width(), self.x() + 12)
+            y = min(max(avail.top(), self.y() + 40), avail.bottom() - dlg.height())
+            dlg.move(max(avail.left(), x), y)
+        except Exception as _exc:
+            _silent_log('_open_appearance_dialog:pos', _exc)
+        dlg.setModal(False)
+        dlg.show()
+        self._appearance_dlg = dlg
+        return dlg
+
+    def _sync_window_to_panel(self):
+        """窗口尺寸跟随面板（保持立绘+空隙差值 320），并钳制在屏幕工作区内——
+        修复：面板被拖大后重新显示，窗口 440x560 装不下导致下半部分（输入框）被截断（v6.19c）"""
+        try:
+            scr = self.screen() or QApplication.primaryScreen()
+            avail = scr.availableGeometry()
+            if getattr(self, '_chat_folded', False):
+                # v6.77 折叠态：只保标题栏高度，别被贴边/显示逻辑撑回 240
+                self.chat_panel.setFixedHeight(self.CHAT_FOLD_H)
+                self.setFixedSize(min(self.width(), avail.width()),
+                                  self.CHAT_FOLD_H + self._pet_band_h())
+                self._place_cloud()
+                return
+            pw = max(300, self.chat_panel.width())
+            ph = max(120, self.chat_panel.height())
+            win_w = pw + 20    # 水平：面板居中 + 左右边距各 10
+            win_h = ph + self._pet_band_h()   # 垂直：立绘 + 底部空隙 60（v6.81 随人物大小变）
+            # 屏幕放不下时：压缩面板高度（优先保证窗口不超屏、不截断）
+            max_ph = avail.height() - self._pet_band_h()
+            if max_ph >= 120 and ph > max_ph:
+                ph = int(max_ph)
+                self.chat_panel.setFixedHeight(ph)
+                win_h = ph + self._pet_band_h()
+            win_w = min(win_w, avail.width())
+            win_h = min(win_h, avail.height())
+            self.setFixedSize(win_w, win_h)
+            nx = max(avail.left(), min(self.x(), avail.right() - win_w))
+            ny = max(avail.top(), min(self.y(), avail.bottom() - win_h))
+            self.move(nx, ny)
+        except Exception:
+            pass
+
+    def toggle_chat_panel(self):
+        """显示/隐藏聊天面板（v6.19c 显示时窗口跟随面板尺寸，不再截断）"""
+        if self.chat_panel.isVisible():
+            self.chat_panel.hide()
+            self.setFixedSize(440, self._win_h())
+        else:
+            self.chat_panel.show()
+            self._sync_window_to_panel()
+
+    def _win_h(self):
+        """窗口该多高（v6.78）：折叠看折叠条，面板隐藏只留立绘，否则按面板高度"""
+        if getattr(self, '_chat_folded', False) and self.chat_panel.isVisible():
+            return self.CHAT_FOLD_H + self._pet_band_h()
+        if not self.chat_panel.isVisible():
+            return self.pet_size + 80      # v6.81：只留立绘时也跟着人物大小走
+        return max(120, self.chat_panel.height()) + self._pet_band_h()
+
+    # ---------- v6.77 对话面板折叠 + 云朵提示 ----------
+    CHAT_FOLD_H = 30        # 折叠后只留标题栏的高度
+
+    def _read_chat_folded(self):
+        """读上次的折叠状态（v6.77）"""
+        try:
+            with open(CONFIG_PATH, encoding='utf-8') as f:
+                return bool((json.load(f) or {}).get('chat_folded', False))
+        except Exception:
+            return False
+
+    def _apply_chat_fold(self, want):
+        """把折叠状态落到界面上（v6.77）"""
+        self._chat_folded = bool(want)
+        self.chat_body.setVisible(not self._chat_folded)
+        self.chat_fold_btn.setText('▸ 展开' if self._chat_folded else '▾ 收起')
+        self.chat_title.setText('💬 对话（已收起）' if self._chat_folded else '💬 对话')
+        if self._chat_folded:
+            self._chat_panel_h = max(120, self.chat_panel.height())
+            self.chat_panel.setFixedHeight(self.CHAT_FOLD_H)
+            self.setFixedSize(self.width(), self.CHAT_FOLD_H + self._pet_band_h())
+        else:
+            self.chat_panel.setFixedHeight(self._chat_panel_h or 240)
+            self._sync_window_to_panel()
+        self._place_cloud()
+
+    def _toggle_chat_fold(self, folded=None):
+        """折叠/展开对话面板并记住（面板右上角按钮与右键菜单都走这里）"""
+        want = (not self._chat_folded) if folded is None else bool(folded)
+        self._apply_chat_fold(want)
+        self._save_cfg_value('chat_folded', want)
+        if not want:
+            self._hide_cloud_hint()
+
+    def _place_cloud(self):
+        """云朵框贴在立绘右上角（v6.77）"""
+        if not hasattr(self, 'cloud'):
+            return
+        cw, ch = 210, 92
+        try:
+            pet = self.pet_stack.geometry()
+            right = pet.right() if pet.width() > 60 else self.width() - 10
+        except Exception:
+            right = self.width() - 10
+        # 尾巴（云朵左侧 20% 处）对准立绘头顶右上方 → 整朵云贴着人物右上角
+        bx = int(min(max(0, self.width() - cw - 2), max(0, right - int(cw * 0.55))))
+        by = int(max(0, min(6, self.height() - ch - 2)))
+        self.cloud.setGeometry(bx, by, cw, ch)
+        self.cloud.raise_()
+
+    def _maybe_cloud_hint(self, text):
+        """对话面板不可见（折叠或整体隐藏）时，才用云朵提示新消息（v6.77）"""
+        if self._chat_folded or not self.chat_panel.isVisible():
+            self._show_cloud_hint(text)
+
+    def _show_cloud_hint(self, text, secs=6):
+        """立绘右上角冒一朵云，点一下展开对话看全文（v6.77）"""
+        preview = ' '.join(str(text or '').split())   # 折行/多空白压成一行（本文件没 import re）
+        if not preview:
+            return
+        if len(preview) > 42:
+            preview = preview[:42] + '…'
+        self.cloud.setText(preview)
+        self._place_cloud()
+        self.cloud.show()
+        self.cloud.raise_()
+        self.cloud_hide_timer.start(int(secs * 1000))
+
+    def _hide_cloud_hint(self):
+        """收起云朵（v6.77）"""
+        try:
+            self.cloud.hide()
+        except Exception:
+            pass
+
+    def _cloud_clicked(self):
+        """点云朵 → 展开对话面板（v6.77）"""
+        self._hide_cloud_hint()
+        if self._chat_folded:
+            self._toggle_chat_fold(False)
+        elif not self.chat_panel.isVisible():
+            self.toggle_chat_panel()
+
+    def _apply_cloud_theme(self):
+        """云朵框跟随主题（颜色都从主题取，模块内零字面量；v6.77）"""
+        try:
+            self.cloud.set_theme(bg=self._solid(self._tk('say_bg')),
+                                 fg=self._tk('say_text'),
+                                 bd=self._solid(self._tk('say_border')))
+        except Exception as e:
+            log.debug('云朵框主题应用失败：%s', e)
+
+    def _chat_panel_press(self, event):
+        """聊天面板按下：下两角（同时改宽高）+ 左/右/下边拖拽（v6.19c 恢复下方两角，上边禁用）"""
+        x = event.position().x()
+        y = event.position().y()
+        w = self.chat_panel.width()
+        h = self.chat_panel.height()
+        edge = 14
+        self._chat_drag_start_x = event.globalPosition().x()
+        self._chat_drag_start_y = event.globalPosition().y()
+        self._chat_drag_start_w = w
+        self._chat_drag_start_h = h
+        self._chat_drag_side = None
+        left, right = x < edge, x > w - edge
+        bottom = y > h - edge
+        if left and bottom:
+            self._chat_drag_mode = 'corner_bl'   # 左下角：向左+向下延伸
+        elif right and bottom:
+            self._chat_drag_mode = 'corner_br'   # 右下角：向右+向下延伸
+        elif left:
+            self._chat_drag_mode = 'h'
+            self._chat_drag_side = 'left'        # 拖左边 → 左边界向左延伸
+        elif right:
+            self._chat_drag_mode = 'h'
+            self._chat_drag_side = 'right'       # 拖右边 → 右边界向右延伸
+        elif bottom:
+            self._chat_drag_mode = 'v_bottom'    # 拖下边 → 下边界向下延伸
+        else:
+            self._chat_drag_mode = None
+        event.accept()
+
+    def _chat_panel_move(self, event):
+        """面板鼠标移动：拖左→左延伸（窗口左移），拖右→右延伸，拖下→下延伸；悬停边缘显示光标（v6.19b）"""
+        mode = self._chat_drag_mode
+        if mode:
+            dx = event.globalPosition().x() - self._chat_drag_start_x
+            dy = event.globalPosition().y() - self._chat_drag_start_y
+            old_w = self.chat_panel.width()
+            old_h = self.chat_panel.height()
+            # 屏幕工作区上限（防止拖大后面板超出屏幕）
+            try:
+                scr = self.screen() or QApplication.primaryScreen()
+                avail = scr.availableGeometry()
+                max_win_w = max(300, avail.width() - 24)
+                max_win_h = max(240, avail.height() - 24)
+                max_panel_w = max(300, max_win_w - (self.width() - old_w))
+                max_panel_h = max(120, max_win_h - (self.height() - old_h))
+            except Exception:
+                max_panel_w, max_panel_h = 700, 900
+            new_w = old_w
+            new_h = old_h
+            move_x = 0  # 窗口 x 位移（左延伸时左移）
+            if mode == 'h':
+                if self._chat_drag_side == 'left':
+                    # 拖左边：向左拖（dx<0）→ 变宽，窗口左移（左边界向左延伸，右边界不动）
+                    new_w = int(max(300, min(self._chat_drag_start_w - dx, 700, max_panel_w)))
+                    move_x = -(new_w - old_w)
+                else:
+                    # 拖右边：向右拖（dx>0）→ 变宽，窗口位置不动（右边界向右延伸）
+                    new_w = int(max(300, min(self._chat_drag_start_w + dx, 700, max_panel_w)))
+            elif mode == 'v_bottom':
+                # 拖下边：下拉（dy>0）→ 变高，窗口位置不动（下边界向下延伸）
+                new_h = int(max(120, min(self._chat_drag_start_h + dy, 900, max_panel_h)))
+            elif mode == 'corner_bl':
+                # 左下角：向左+向下同时延伸（v6.19c 恢复下两角双维拖拽）
+                new_w = int(max(300, min(self._chat_drag_start_w - dx, 700, max_panel_w)))
+                move_x = -(new_w - old_w)
+                new_h = int(max(120, min(self._chat_drag_start_h + dy, 900, max_panel_h)))
+            elif mode == 'corner_br':
+                # 右下角：向右+向下同时延伸
+                new_w = int(max(300, min(self._chat_drag_start_w + dx, 700, max_panel_w)))
+                new_h = int(max(120, min(self._chat_drag_start_h + dy, 900, max_panel_h)))
+            # 基于窗口位置的底部限制：窗口底部不超屏幕底（防止输入框被屏幕/窗口截断）
+            if mode in ('v_bottom', 'corner_bl', 'corner_br'):
+                try:
+                    avail_bottom = (self.screen() or QApplication.primaryScreen()).availableGeometry().bottom()
+                    max_h_by_pos = max(120, avail_bottom - (self.y() + self.height() - old_h))
+                    new_h = min(new_h, max_h_by_pos)
+                except Exception:
+                    pass
+            delta_w = new_w - old_w
+            delta_h = new_h - old_h
+            if delta_w or delta_h:
+                self.chat_panel.setFixedSize(new_w, new_h)
+                self.setFixedSize(self.width() + delta_w, self.height() + delta_h)
+                # 屏幕边界保护：窗口完整落在工作区内（左缘/底缘）
+                try:
+                    avail = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+                    nx = self.x() + move_x
+                    nx = max(avail.left(), min(nx, avail.right() - self.width()))
+                    ny = max(avail.top(), min(self.y(), avail.bottom() - self.height()))
+                    if nx != self.x() or ny != self.y():
+                        self.move(nx, ny)
+                except Exception:
+                    pass
+        else:
+            # 悬停光标提示（边缘可拖拽）——鼠标在子控件上（文本/卡片/输入框）时不干预光标，
+            # 否则会把文本的选择光标盖成边缘拖拽图标（v6.17 修复）
+            child = self.chat_panel.childAt(event.position().toPoint())
+            if child is not None and child is not self.chat_panel:
+                self.chat_panel.setCursor(Qt.ArrowCursor)
+                event.accept()
+                return
+            x = event.position().x()
+            y = event.position().y()
+            w = self.chat_panel.width()
+            h = self.chat_panel.height()
+            edge = 14
+            left, right = x < edge, x > w - edge
+            bottom = y > h - edge
+            if left and bottom:
+                cur = Qt.SizeBDiagCursor   # 左下角（\ 方向）
+            elif right and bottom:
+                cur = Qt.SizeFDiagCursor   # 右下角（/ 方向）
+            elif left or right:
+                cur = Qt.SizeHorCursor
+            elif bottom:
+                cur = Qt.SizeVerCursor
+            else:
+                cur = Qt.ArrowCursor
+            self.chat_panel.setCursor(cur)
+        event.accept()
+
+    def _chat_panel_release(self, event):
+        self._chat_drag_mode = None
+        event.accept()
+
+    def _auto_resize_input(self):
+        """输入框高度自适应：内容多自动增高（单行 34px ~ 上限 120px），超上限内部滚动"""
+        try:
+            doc = self.chat_input.document()
+            content_h = int(doc.size().height()) + 10  # 内容高度 + 上下 padding
+            new_h = max(34, min(content_h, 120))
+            if self.chat_input.height() != new_h:
+                self.chat_input.setFixedHeight(new_h)
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        """输入框事件：Enter 发送（Shift+Enter 换行）；Ctrl+V 粘贴截图自动 OCR；Ctrl+N 新开对话"""
+        from PySide6.QtCore import QEvent
+        if obj is self.chat_input and event.type() == QEvent.Type.KeyPress:
+            # 截图粘贴：剪贴板有图片 → OCR 流程；无图 → 正常文本粘贴
+            if event.key() == Qt.Key_V and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                if self._handle_pasted_image():
+                    return True
+            # v6.80：Ctrl+N = 新开对话
+            if event.key() == Qt.Key_N and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self._new_conversation()
+                return True
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                    self._on_chat_input()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _handle_pasted_image(self):
+        """检测剪贴板内容：①文件（粘贴文件→附件卡片）②图片（暂存待发送）；都没有放行文本"""
+        # ① 剪贴板是文件 → 统一暂存（附件卡片）
+        try:
+            md = QApplication.clipboard().mimeData()
+            if md and md.hasUrls():
+                urls = [u for u in md.urls() if u.isLocalFile()]
+                if urls:
+                    for u in urls:
+                        self._add_attachment(u.toLocalFile())
+                    return True
+        except Exception:
+            pass
+        # ② 剪贴板是图片 → 统一暂存（附件卡片）
+        try:
+            img = QApplication.clipboard().image()
+            if img.isNull():
+                return False
+        except Exception:
+            return False
+        # v6.51：文件名带毫秒时间戳——原先固定名 _pasted_ocr.png，连粘两张图时
+        # 两个附件卡片会指向同一文件，先粘的那张内容被覆盖（OCR/送模型全错）
+        path = os.path.join(BASE_DIR, '_pasted_ocr_%d.png' % int(time.time() * 1000))
+        try:
+            img.save(path, 'PNG')
+        except Exception:
+            return False
+        self._add_attachment(path)
+        return True
+
+    def _insert_dropped_paths(self, urls):
+        """拖放文件 → 路径插入输入框（用户可继续输入需求）"""
+        from PySide6.QtCore import QUrl
+        paths = []
+        for u in urls:
+            try:
+                p = u.toLocalFile() if isinstance(u, QUrl) else str(u)
+            except Exception:
+                p = str(u)
+            if p:
+                paths.append(p)
+        if not paths:
+            return
+        cur = self.chat_input.toPlainText()
+        sep = ' ' if cur and not cur.endswith(' ') else ''
+        self.chat_input.setPlainText(cur + sep + ' '.join(paths))
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dropEvent(self, e):
+        # v6.86：拖**文件**到桌宠身上 = 打开文件转换面板（拖到输入框里还是加附件，两不打架）
+        if e.mimeData().hasUrls():
+            try:
+                picked = []
+                for u in e.mimeData().urls():
+                    if u.isLocalFile():
+                        p = u.toLocalFile()
+                        if p and (os.path.isfile(p) or os.path.isdir(p)):   # v6.87：文件夹也收（递归展开）
+                            picked.append(p)
+                if picked and not e.modifiers() & Qt.ControlModifier:
+                    self.open_convert_panel(picked)
+                    e.accept()
+                    return
+            except Exception as _exc:
+                _silent_log('dropEvent:convert', _exc)
+            self._insert_dropped_paths(e.mimeData().urls())
+            e.accept()
+        else:
+            super().dropEvent(e)
+
+
+
+
+
+    def _add_attachment(self, path):
+        """加入待发附件（统一暂存，显示卡片）"""
+        if not path or not os.path.isfile(path):
+            return
+        ext = os.path.splitext(path)[1].lower()
+        TEXT_EXTS = ('.txt', '.md', '.log', '.json', '.csv', '.py', '.ps1', '.bat', '.ini', '.cfg',
+                     '.yml', '.yaml', '.xml', '.svg', '.html', '.htm', '.css', '.js', '.ts', '.java',
+                     '.c', '.cpp', '.h', '.go', '.rs', '.sh', '.sql', '.toml', '.properties')
+        if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif'):
+            kind, icon = 'image', '🖼'
+        elif ext in TEXT_EXTS:
+            kind, icon = 'text', '📄'
+        elif ext in ('.docx', '.doc'):
+            kind, icon = 'docx', '📘'
+        elif ext == '.pdf':
+            kind, icon = 'pdf', '📕'
+        elif ext in ('.xlsx', '.xls'):
+            kind, icon = 'xlsx', '📗'
+        elif ext in ('.pptx', '.ppt'):
+            kind, icon = 'pptx', '📙'
+        else:
+            kind, icon = 'other', '📎'
+        try:
+            size = os.path.getsize(path)
+            size_txt = f'{size / 1024:.0f}KB' if size < 1024 * 1024 else f'{size / 1024 / 1024:.1f}MB'
+        except Exception:
+            size_txt = '?'
+        att = {'path': path, 'kind': kind, 'icon': icon, 'name': os.path.basename(path), 'size': size_txt}
+        if att not in self._pending_attachments:
+            self._pending_attachments.append(att)
+        self._refresh_attach_bar()
+
+    def _remove_attachment(self, att):
+        if att in self._pending_attachments:
+            self._pending_attachments.remove(att)
+        self._refresh_attach_bar()
+
+    def _refresh_attach_bar(self):
+        """重建附件卡片栏"""
+        lay = self.attach_bar_layout
+        while lay.count() > 1:  # 保留末尾 stretch
+            item = lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for att in self._pending_attachments:
+            lay.insertWidget(lay.count() - 1, self._make_attach_card(att))
+        self.attach_bar.setVisible(bool(self._pending_attachments))
+
+    def _make_attach_card(self, att):
+        """附件卡片：图标 + 文件名 + 大小 + ✕"""
+        card = QFrame(self.attach_bar)
+        self._set_themed_qss(card, lambda: 'QFrame{background:%s;border:1px solid %s;border-radius:6px;}'
+                             % (self._tk('ui_card_bg'), self._tk('ui_card_border')))
+        hl = QHBoxLayout(card)
+        hl.setContentsMargins(8, 3, 6, 3)
+        hl.setSpacing(5)
+        icon = QLabel(att['icon'], card)
+        icon.setStyleSheet('background:transparent;border:none;font-size:13px;')
+        hl.addWidget(icon)
+        nm = QLabel(att['name'], card)
+        nm.setStyleSheet(f'background:transparent;border:none;color:{self._tk("ui_card_text")};font-size:11px;')
+        nm.setMaximumWidth(130)
+        nm.setToolTip(att['path'])
+        hl.addWidget(nm)
+        sz = QLabel(att['size'], card)
+        sz.setStyleSheet(f'background:transparent;border:none;color:{self._tk("ui_card_text_dim")};font-size:10px;')
+        hl.addWidget(sz)
+        xb = QPushButton('✕', card)
+        xb.setFixedSize(16, 16)
+        self._set_themed_qss(xb, lambda: (
+            'QPushButton{background:transparent;border:none;color:%s;font-size:10px;}' % self._tk('ui_card_btn')
+            + 'QPushButton:hover{color:%s;}' % self._tk('ui_card_btn_hover')))
+        xb.clicked.connect(lambda: self._remove_attachment(att))
+        hl.addWidget(xb)
+        return card
+
+    def _pick_attach_files(self):
+        """📎 附加文件：打开文件选择器，多选后逐个处理"""
+        from PySide6.QtWidgets import QFileDialog
+        files, _ = QFileDialog.getOpenFileNames(
+            self, self._t('attach_tip') if hasattr(self, '_t') else '附加文件',
+            '', '所有文件 (*.*)')
+        for f in files[:5]:
+            self._add_attachment(f)
+        if len(files) > 5:
+            self._notify('一次最多处理 5 个文件，已忽略其余')
+
+    def _handle_dropped_files(self, urls):
+        """处理拖入的文件列表"""
+        from PySide6.QtCore import QUrl
+        paths = []
+        for u in urls:
+            try:
+                p = u.toLocalFile() if isinstance(u, QUrl) else str(u)
+            except Exception:
+                p = str(u)
+            if p and os.path.isfile(p):
+                paths.append(p)
+        if paths:
+            for p in paths[:5]:
+                self._attach_file(p)
+            if len(paths) > 5:
+                self._notify('一次最多处理 5 个文件，已忽略其余')
+
+    def _attach_file(self, path):
+        """按类型处理拖入文件：图片→OCR，文本→读内容发AI，其他→路径"""
+        ext = os.path.splitext(path)[1].lower()
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        base = os.path.basename(path)
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            size = 0
+        size_txt = f'{size / 1024:.0f}KB' if size < 1024 * 1024 else f'{size / 1024 / 1024:.1f}MB'
+        if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp'):
+            self._append_chat('我', f'🖼 [{base}]（{size_txt}·图片）')
+            if self._vision_ready():
+                # v6.62：图片直接交给模型看（不再先 OCR 成文字，图表/版面信息不丢）
+                self.ask_ai(('（用户放入一张图片，已直接附在消息里，请直接看图回答）' if not is_en
+                             else '(User dropped an image; it is attached. Please look at it.)'),
+                            images=[path])
+                return
+            dst = os.path.join(BASE_DIR, '_dropped_img.png')
+            try:
+                from PIL import Image
+                Image.open(path).convert('RGB').save(dst, 'PNG')
+                self._notify('🔍 正在识别图片文字…' if not is_en else '🔍 Recognizing text…')
+                import threading
+                threading.Thread(target=lambda: self.ocr_signal.emit(pl.ocr_image(dst, OCR_PS1)), daemon=True).start()
+            except Exception as e:
+                self._notify(f'图片处理失败：{e}' if not is_en else f'Image error: {e}')
+        elif ext in ('.txt', '.md', '.log', '.json', '.csv', '.py', '.ps1', '.bat', '.ini', '.cfg', '.yml', '.yaml'):
+            try:
+                with open(path, encoding='utf-8', errors='ignore') as f:
+                    content = f.read(2500)
+                self._append_chat('我', f'📄 [{base}]（{size_txt}·文本 {len(content)} 字）')
+                self.ask_ai(f'（用户放入文件：{base}，内容如下，请分析/回答）\n{content}')
+            except Exception as e:
+                self._notify(f'文件读取失败：{e}' if not is_en else f'Read error: {e}')
+        else:
+            self._append_chat('我', f'📎 [{base}]（{size_txt}·{ext[1:] or "未知"}）')
+            self.ask_ai(f'（用户放入文件：{path}。若需要读取内容请提示用户配合，或根据文件名/路径回应）')
+
+    def _on_ocr_result(self, text):
+        """OCR 完成：识别内容显示为消息并发送给 AI"""
+        # v6.51：粘贴图文件名带时间戳了，这里用通配清理（旧固定名也一并清掉）
+        import glob as _glob
+        for p in (_glob.glob(os.path.join(BASE_DIR, '_pasted_ocr*.png')) +
+                  _glob.glob(os.path.join(BASE_DIR, '_dropped_img*.png'))):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        if not text.strip():
+            self._notify('😕 没识别到文字（可能是纯图片或截图太糊）' if not is_en else '😕 No text recognized')
+            return
+        self._chat_type_finish()
+        self._append_chat('我', f'📷 截图识别（{len(text)} 字）→ 已发送分析')
+        self.ask_ai((f'（用户发来一张截图，OCR 识别内容如下，请根据内容回答或处理）\n{text}'
+                    if not is_en else f'(User sent a screenshot. OCR result below; answer or act on it.)\n{text}'))
+
+    def _on_screenshot_hotkey(self):
+        """全局快捷键 Ctrl+Alt+S：截全屏 → OCR → 发给 AI 分析"""
+        try:
+            from PIL import ImageGrab
+            is_en = getattr(self, 'language', 'zh') == 'en'
+            self._notify('📸 截屏中…' if not is_en else '📸 Capturing…')
+            img = ImageGrab.grab()
+            path = os.path.join(BASE_DIR, '_screenshot_ocr.png')
+            img.save(path, 'PNG')
+            import threading
+            if self._vision_ready():
+                # v6.62：全屏截图直接交给模型看（版面/图表信息不再丢）
+                self.ask_ai(('（用户截了一张全屏图，已直接附在消息里，请看图回答）' if not is_en
+                             else '(User took a screenshot; it is attached. Please look at it.)'),
+                            images=[path])
+                return
+            def worker():
+                try:
+                    self.ocr_signal.emit(pl.ocr_image(path, OCR_PS1))
+                except Exception:
+                    pass
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            self._notify(f'截图失败：{e}' if not is_en else f'Capture failed: {e}')
+
+    def _on_chat_input(self):
+        """处理聊天输入：本地指令 / AI 对话（含暂存图片：OCR 后连同文字要求一起发）"""
+        if self._pending_attachments:
+            atts = list(self._pending_attachments)
+            self._pending_attachments = []
+            self._refresh_attach_bar()
+            text = self.chat_input.toPlainText().strip()
+            is_en = getattr(self, 'language', 'zh') == 'en'
+            self.chat_input.clear()
+            names = '、'.join(a['name'] for a in atts[:3])
+            if len(atts) > 3:
+                names += f' 等{len(atts)}个'
+            self._append_chat('我', f'{atts[0]["icon"]} [{names}]' + (f'：{text}' if text else ''))
+            import threading
+
+            def atts_ask():
+                try:
+                    parts = []
+                    images = [a for a in atts if a['kind'] == 'image']
+                    for a in atts:
+                        if a['kind'] == 'image':
+                            continue
+                        if a['kind'] == 'text':
+                            try:
+                                with open(a['path'], encoding='utf-8', errors='ignore') as fp:
+                                    content = fp.read()
+                                if len(content) > 8000:
+                                    parts.append(f'【{a["name"]}】（共 {len(content)} 字符，仅读取前 8000 字符，如需完整内容请让用户分段提供）\n{content[:8000]}')
+                                else:
+                                    parts.append(f'【{a["name"]}】\n{content}')
+                            except Exception:
+                                parts.append(f'【{a["name"]}】（读取失败）')
+                        elif a['kind'] == 'docx':
+                            content = read_docx_text(a['path'])
+                            if len(content) > 8000:
+                                parts.append(f'【{a["name"]}】（共 {len(content)} 字符，仅读取前 8000 字符）\n{content[:8000]}')
+                            else:
+                                parts.append(f'【{a["name"]}】\n{content}')
+                        elif a['kind'] == 'pdf':
+                            content = read_pdf_text(a['path'])
+                            if len(content) > 8000:
+                                parts.append(f'【{a["name"]}】（共 {len(content)} 字符，仅读取前 8000 字符）\n{content[:8000]}')
+                            else:
+                                parts.append(f'【{a["name"]}】\n{content}')
+                        elif a['kind'] == 'xlsx':
+                            content = read_xlsx_text(a['path'])
+                            if len(content) > 8000:
+                                parts.append(f'【{a["name"]}】（共 {len(content)} 字符，仅读取前 8000 字符）\n{content[:8000]}')
+                            else:
+                                parts.append(f'【{a["name"]}】\n{content}')
+                        elif a['kind'] == 'pptx':
+                            content = read_pptx_text(a['path'])
+                            if len(content) > 8000:
+                                parts.append(f'【{a["name"]}】（共 {len(content)} 字符，仅读取前 8000 字符）\n{content[:8000]}')
+                            else:
+                                parts.append(f'【{a["name"]}】\n{content}')
+                        else:
+                            parts.append(f'【{a["name"]}】路径：{a["path"]}')
+                    vision_imgs = []
+                    if images:
+                        if self._vision_ready():
+                            # v6.62：图片直接附在消息里（不再 OCR）
+                            vision_imgs = [a['path'] for a in images]
+                        else:
+                            for a in images:
+                                try:
+                                    ocr_text = pl.ocr_image(a['path'], OCR_PS1)
+                                    parts.append(f'【图片 {a["name"]} OCR】\n{ocr_text}')
+                                except Exception:
+                                    parts.append(f'【图片 {a["name"]}】（OCR 失败）')
+                    body = '\n\n'.join(parts) if parts else '（无内容）'
+                    req = text or '请查看这些文件并简要说明内容'
+                    head = f'（用户放入 {len(atts)} 个附件'
+                    if vision_imgs:
+                        head += f'，其中 {len(vision_imgs)} 张图片已直接附在本消息里（请直接看图，不要依赖文字描述）'
+                    self.ask_ai(head + '，内容如下）' + (f'\n{body}' if parts else '')
+                                  + f'\n\n用户要求：{req}', images=vision_imgs)
+                except Exception:
+                    pass
+            threading.Thread(target=atts_ask, daemon=True).start()
+            return
+        raw = self.chat_input.toPlainText().strip()
+        if not raw:
+            self.chat_input.clear()
+            return
+        # 剥离用户消息的情绪标签并触发立绘
+        text, u_emotion = self._strip_emotion_tag(raw)
+        if not text:
+            text = raw
+        if u_emotion:
+            self._apply_emotion(u_emotion)
+        # 打字机进行中 → 先立即完成（避免两条消息交错）
+        self._chat_type_finish()
+        self.chat_input.clear()
+        # v6.80：/new 直接开新对话（这条指令本身不进历史，也不发给模型）
+        if text.strip().lower() in ('/new', '/新对话', '/新聊天'):
+            self._new_conversation()
+            return
+        self._append_chat('我', text)
+        low = text.lower()
+
+        if low == '/stop':
+            self._stop_ai()
+            self._notify('⏹ 已停止当前任务并取消未完成任务')
+            return
+        if low == '/clear':
+            self._clear_chat_memory()
+            self._notify('聊天记录已清空')
+            return
+        if low == '/help':
+            self._append_chat('桌宠', '指令：/new 新开对话 · /clear 清空 · /time 时间 · /calc 算式 · /weather 天气 · /person 性格 · /run 程序 · /remind 秒 内容 · /pomo 番茄钟 · /lock 锁屏 · /sound 音效 · /todo 待办清单 · /回忆 关键词；直接聊天即可，Ctrl+V 可粘贴截图识别')
+            return
+        if low == '/todo':
+            self._append_chat('桌宠', self._manage_todo('list'))
+            return
+        if low == '/time':
+            import datetime
+            self._append_chat('桌宠', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            return
+        if low.startswith('/calc '):
+            # 复用 tools_executor.calculate_expr（AST 白名单，不再用 eval）
+            self._append_chat('桌宠', calculate_expr(low[6:]))
+            return
+        if low == '/weather':
+            self.ask_ai(f'帮我查一下{self.pet_city}现在的天气')
+            return
+        if low.startswith('/person'):
+            parts = text.split()
+            p = parts[1] if len(parts) > 1 else '温柔'
+            self._set_personality(p)
+            return
+        if low.startswith('/run '):
+            self._append_chat('桌宠', self._smart_open(low[5:].strip()))
+            return
+        if low == '/lock':
+            try:
+                pl.lock_screen()
+            except Exception:
+                self._notify('锁屏失败')
+            return
+        if low.startswith('/remind '):
+            parts = text[8:].split(' ', 1)
+            try:
+                sec = int(parts[0].strip())
+                msg = parts[1].strip() if len(parts) > 1 else '该做事啦'
+                self._add_reminder(sec, msg)
+            except Exception:
+                self._notify('用法：/remind 60 喝水')
+            return
+        if low == '/pomo':
+            self._add_reminder(25 * 60, '番茄钟结束，休息一下！')
+            self._notify('🍅 25 分钟番茄钟已开始，到点提醒')
+            return
+        if low == '/sound':
+            self._play_sound('msg')
+            self._notify('🔔 测试音效')
+            return
+        if low.startswith('/回忆') or low.startswith('/recall'):
+            # v6.63：搜共同经历（纯本地，不花 API）
+            parts = text.split(' ', 1)
+            q = parts[1].strip() if len(parts) > 1 else ''
+            if not q:
+                self._append_chat('桌宠', '用法：/回忆 关键词（例如 /回忆 扫雷）—— 会在「记住的事」和「共同经历」里搜')
+                return
+            self._append_chat('桌宠', self._recall_text(q))
+            return
+        # 其他走 AI
+        self.ask_ai(text)
+
+    def _save_cfg_value(self, key, value):
+        """写 config.json 并热加载（改配置立即生效）"""
+        try:
+            cfg = {}
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+            cfg[key] = value
+            self._atomic_write_json(CONFIG_PATH, cfg)
+            self._load_ai_config()
+            return True
+        except Exception as e:
+            self._notify(f'配置保存失败：{e}')
+            return False
+
+    def _set_reply_style(self, val, label):
+        """设置回复风格（short/normal/detailed）"""
+        if self._save_cfg_value('reply_style', val):
+            self._notify(f'回复风格：{label}')
+
+    def _log_ai_abort(self, stage):
+        """v6.53：把“被停止 / 被新任务顶替”记进日志（原先静默 return，出问题无从下手）"""
+        try:
+            from pet_log import get_logger as _gl
+            _gl('pet.ai').warning('AI 任务中断（%s）gen=%s cur=%s busy=%s',
+                                  stage, getattr(self, '_ai_generation', None),
+                                  getattr(self, '_cur_gen', None), getattr(self, '_ai_busy', None))
+        except Exception:
+            pass
+
+    def set_foreground_aware(self, on):
+        """v6.59：前台程序感知开关（默认关）。开启后仅在唤醒判断里附加「当前前台程序」信号。
+
+        隐私：只读进程名，不读窗口标题/内容、不截屏、不联网（见 pet_foreground 模块头部）。
+        """
+        on = bool(on)
+        self.foreground_aware = on
+        if not self._save_cfg_value('foreground_aware', on):
+            return
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        if on:
+            cur = pl.foreground_process() or '—'
+            msg = (f'前台程序感知：已开启（当前检测到 {cur}）。只读程序名，不读窗口标题。'
+                   if not is_en else f'Foreground awareness ON (now: {cur})')
+        else:
+            msg = '前台程序感知：已关闭' if not is_en else 'Foreground awareness OFF'
+        self._notify(msg)
+        self._sync_settings_ui()
+
+    def _set_advanced_tools(self, on):
+        """v6.53：切换「进阶工具模式」——开 = 放开全部工具，关 = 只留 core 8 个"""
+        on = bool(on)
+        self.advanced_tools = on
+        if not self._save_cfg_value('advanced_tools', on):
+            return
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        try:
+            n = len(tools_for_mode(on))
+        except Exception:
+            n = 0
+        self._notify((f'工具范围：{"全部 %d 个" % n if on else "常用 %d 个（已收起进阶工具）" % n}'
+                                  if not is_en else
+                                  (f'Tools: all {n} enabled' if on else f'Tools: {n} core tools only')))
+        self._sync_settings_ui()
+
+    def _sync_settings_ui(self):
+        """v6.53：设置窗口开着时，参数改完立即回填（修“存了但界面没变”）"""
+        try:
+            for w in self.findChildren(SettingsDialog):
+                if w.isVisible():
+                    w._refresh()
+        except Exception:
+            pass
+
+    def _set_max_tokens(self, val, label):
+        """设置回复 token 上限（v6.53：改走模型档案 —— 与设置窗口「回复长度」同一份真相）"""
+        if self._save_profile_param('max_tokens', val):
+            self._notify(f'回复长度上限：{label}')
+            self._sync_settings_ui()
+
+    def _set_max_tokens_dialog(self):
+        """弹窗自定义 token 上限（对齐 DeepSeek API：输出上限 384K，给到 128K 足够日常）"""
+        from PySide6.QtWidgets import QInputDialog
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        text, ok = QInputDialog.getText(self, self._t('dlg_tokens'),
+            f'输入 token 上限（{MIN_OUTPUT_TOKENS}-{MAX_OUTPUT_TOKENS}，越大回复越长）：' if not is_en
+            else f'Enter token limit ({MIN_OUTPUT_TOKENS}-{MAX_OUTPUT_TOKENS}, higher = longer replies):',
+            text=str(getattr(self, 'max_tokens', 1000)))
+        if ok and text.strip().isdigit():
+            val = clamp_tokens(text.strip())
+            # v6.53：原先写 config.json（但读的是 models.json 的档案 → 界面没变、实际不生效）
+            if self._save_profile_param('max_tokens', val):
+                self._notify(f'回复长度上限：{val} token（已写入模型档案）' if not is_en
+                                  else f'Reply length limit: {val} tokens (saved to model profile)')
+                self._sync_settings_ui()
+
+    def _set_city_dialog(self):
+        """弹窗设置默认城市"""
+        from PySide6.QtWidgets import QInputDialog
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        text, ok = QInputDialog.getText(self, self._t('dlg_city'),
+            '输入默认天气城市：' if not is_en else 'Enter default weather city:', text=self.pet_city)
+        if ok and text.strip():
+            if self._save_cfg_value('city', text.strip()):
+                self._notify(f'默认城市：{text.strip()}' if not is_en else f'Default city: {text.strip()}')
+
+    def _set_api_key_dialog(self):
+        """弹窗设置 DeepSeek API Key（保存后热加载生效）"""
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        cur = getattr(self, 'ai_key', '') or ''
+        if len(cur) > 12:
+            masked = cur[:6] + '…' + cur[-4:]
+        elif cur:
+            masked = cur
+        else:
+            masked = '（未配置）' if not is_en else '(not set)'
+        text, ok = QInputDialog.getText(self, self._t('dlg_api'),
+            (f'输入 DeepSeek API Key（留空取消）：\n当前：{masked}' if not is_en else f'Enter DeepSeek API key (leave empty to cancel):\nCurrent: {masked}'),
+            QLineEdit.Password, cur)
+        if ok and text.strip():
+            if self._save_cfg_value('deepseek_api_key', text.strip()):
+                self._notify('✅ API Key 已更新，AI 立即生效' if not is_en else '✅ API key updated, AI takes effect immediately')
+
+    def _set_search_key_dialog(self):
+        """弹窗设置 Tavily 联网搜索 API Key（可选，配置后 AI 可联网查最新信息）"""
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        cur = getattr(self, 'search_api_key', '') or ''
+        if len(cur) > 12:
+            masked = cur[:6] + '…' + cur[-4:]
+        elif cur:
+            masked = cur
+        else:
+            masked = '（未配置）' if not is_en else '(not set)'
+        text, ok = QInputDialog.getText(self, self._t('dlg_search'),
+            (f'输入 Tavily 联网搜索 API Key（留空取消；https://tavily.com 免费注册，每月 1000 次）：\n当前：{masked}'
+             if not is_en else f'Enter Tavily search API key (leave empty to cancel; free 1000/mo at tavily.com):\nCurrent: {masked}'),
+            QLineEdit.Password, cur)
+        if ok and text.strip():
+            if self._save_cfg_value('search_api_key', text.strip()):
+                self.search_api_key = text.strip()
+                self._notify('✅ 联网搜索已配置，AI 可查询最新信息' if not is_en else '✅ Search configured, AI can browse for latest info')
+
+    def _save_profile_param(self, name, value):
+        """写当前角色的档案参数并落盘（思考开关 / 采样温度等）"""
+        prof = self._current_profile()
+        if prof is None:
+            return False
+        if not MODEL_REGISTRY.set_param(prof.key, name, value):
+            return False
+        MODEL_REGISTRY.save()
+        self._load_ai_config()      # 热加载：参数立即生效 + 菜单勾选态刷新
+        return True
+
+    def _request_endpoint(self):
+        """真正要发请求的地址（v6.62）：开了 strict 工具就走 /beta（官方要求）
+
+        其余情况用档案里的正式地址；自定义中转地址时 beta_endpoint 会原样返回。
+        """
+        try:
+            ep = self._current_endpoint()
+        except Exception:
+            ep = DEFAULT_ENDPOINT
+        return beta_endpoint(ep) if getattr(self, 'strict_tools', False) else ep
+
+    def _tools_payload(self, cur_model=None):
+        """工具 schema（v6.62）：开了 strict 就把“能安全严格”的工具转严格版"""
+        base = (tools_for_mode(getattr(self, 'advanced_tools', False))
+                + self.mcp.tool_schemas() + self.plugin_mgr.tool_schemas())
+        if not getattr(self, 'strict_tools', False):
+            return base
+        out, _names = strict_tools(base)
+        return out
+
+    def _remember_reasoning(self, reply, reasoning):
+        """v6.62：记住本轮回复的思考内容（官方称带 tools 时应随历史回传）
+
+        只留一轮、并截断到 4000 字符：回传是官方推荐，但不该把历史 token 吹大。
+        """
+        rsn = str(reasoning or '').strip()
+        self._last_turn_reasoning = (str(reply or '').strip(), rsn[:4000]) if rsn else None
+
+    def _with_reasoning_history(self, msgs):
+        """v6.62：把上一轮 assistant 的 reasoning_content 补回历史（同内容匹配）"""
+        try:
+            last = getattr(self, '_last_turn_reasoning', None)
+            if not last:
+                return msgs
+            reply, rsn = last
+            for i in range(len(msgs) - 1, -1, -1):
+                m = msgs[i]
+                if m.get('role') == 'assistant' and str(m.get('content') or '').strip() == reply:
+                    out = list(msgs)
+                    out[i] = dict(m, reasoning_content=rsn)
+                    return out
+        except Exception as _exc:
+            _silent_log('_with_reasoning_history', _exc)
+        return msgs
+
+    def _thinking_fields(self):
+        """v6.62：思考相关的请求体字段（全项目唯一一处，测试护栏盯这里）
+
+        修复背景：设置里的「思考模式」原先只驱动 UI，从未进过请求体，
+        而官方默认 thinking=enabled、effort=high —— 所谓「关掉思考」根本没关。
+        规则：关思考（或强度=none）→ 只发 thinking.disabled；
+        开思考 → 同时带 reasoning_effort（none 与 enabled 自相矛盾，故归一成 disabled）。
+        """
+        effort = clamp_effort(getattr(self, 'reasoning_effort', DEFAULT_EFFORT))
+        on = bool(getattr(self, 'reasoning_enabled', True)) and effort != 'none'
+        if not on:
+            return {'thinking': {'type': 'disabled'}}
+        return {'thinking': {'type': 'enabled'}, 'reasoning_effort': effort}
+
+    def _toggle_reasoning(self):
+        """切换思考模式（写进当前角色的模型档案）"""
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        want = not getattr(self, 'reasoning_enabled', True)
+        if not self._save_profile_param('reasoning', want):
+            return
+        msg = ('思考模式已开启' if want else '思考模式已关闭') if not is_en else \
+              ('Thinking on' if want else 'Thinking off')
+        self._notify(msg + ('（已写入模型档案）' if not is_en else ' (saved to model profile)'))
+
+    def _set_reasoning_effort(self, val):
+        """设置思考强度（写进当前角色的模型档案；v6.62）"""
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        if not self._save_profile_param('effort', val):
+            return
+        self._notify((f'思考强度：{val}' if not is_en else f'Reasoning effort: {val}')
+                     + ('（已写入模型档案）' if not is_en else ' (saved to model profile)'))
+
+    def _toggle_vision(self):
+        """开关「图片直接交给模型看」（写进当前角色档案的 vision 字段；v6.62）"""
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        prof = self._current_profile()
+        if prof is None:
+            return
+        want = not bool(getattr(self, 'vision_enabled', False))
+        if not MODEL_REGISTRY.set_field(prof.key, 'vision', want):
+            return
+        MODEL_REGISTRY.save()
+        self._load_ai_config()
+        self._notify(('图片已改为直接交给模型看' if want else '图片已改回本地文字识别（OCR）')
+                     + ('（已写入模型档案）' if not is_en else ' (saved to model profile)'))
+
+    def _toggle_cfg_flag(self, cfg_key, attr, on_msg, off_msg):
+        """v6.62：翻转一个全局布尔配置并落盘（走 _save_cfg_value 的热加载）"""
+        want = not bool(getattr(self, attr, False))
+        if self._save_cfg_value(cfg_key, want):
+            self._notify(on_msg if want else off_msg)
+
+    def _toggle_pass_reasoning(self):
+        """回传上轮思考内容（官方称带 tools 时应回传；略增 token）"""
+        self._toggle_cfg_flag('pass_reasoning_history', 'pass_reasoning_history',
+                              '已开启：多轮对话回传上一轮思考内容（官方推荐）',
+                              '已关闭：不回传历史思考内容')
+
+    def _toggle_strict_tools(self):
+        """strict 严格工具参数校验（需走 /beta）"""
+        self._toggle_cfg_flag('strict_tools', 'strict_tools',
+                              '已开启严格工具参数（请求改走 /beta，参数写错更少）',
+                              '已关闭严格工具参数校验')
+
+    def _toggle_vision_files(self):
+        """图片走 Files API 复用（同一张图只上传一次）"""
+        self._toggle_cfg_flag('vision_files_api', 'vision_files_api',
+                              '已开启：图片上传官方文件接口后复用（同图只传一次）',
+                              '已关闭：图片按 base64 直发')
+
+    # ---------- v6.63：语音朗读（只做输出，不做语音输入） ----------
+    def _speak_reply(self, text):
+        """朗读一段回复（v6.76：按「朗读内容」策略取要念的文本）
+
+        voice_content_mode：
+          summary（默认）→ 有 AI 摘要就念摘要；没有就“首段 + 末段”“未选中不自动念”
+          full           → 全文（旧行为）
+          manual         → 不自动念（只在你选中后右键朗读）
+        """
+        try:
+            from voice_io import choose_speech_text, clean_for_speech
+            mode = str(getattr(self, 'voice_content_mode', 'summary') or 'summary')
+            picked, note = choose_speech_text(text, mode, summary=getattr(self, '_voice_summary', ''))
+            if note:
+                _silent_log('_speak_reply.policy', note)
+            if picked:
+                self._last_spoken_text = clean_for_speech(picked)   # 供「朗读上一条」手动使用
+            if not picked:
+                return False
+            if not getattr(self, 'voice_enabled', False):
+                return False
+            v = getattr(self, 'voice', None)
+            return bool(v and v.speak(picked))
+        except Exception as _exc:
+            _silent_log('_speak_reply', _exc)
+            return False
+
+    def _set_voice_content_mode(self, mode):
+        """设置「朗读内容」策略（v6.76）：summary（默认）/ full / manual"""
+        val = str(mode or '').strip().lower()
+        if val not in ('summary', 'full', 'manual'):
+            val = 'summary'
+        self.voice_content_mode = val
+        try:
+            self._save_cfg_value('voice_content_mode', val)
+        except Exception as e:
+            _silent_log('_set_voice_content_mode', e)
+        try:
+            self._notify('朗读内容：%s' % {'summary': '要点优先', 'full': '全文',
+                                          'manual': '只念我选中的'}[val])
+        except Exception:
+            pass
+        return val
+
+    def _tool_set_voice_summary(self, args):
+        """AI 声明“这段该怎么念”（v6.76）——只影响朗读，不进正文
+
+        约定：长回复时调用它给 1~2 句朗读摘要；短回复不用调。
+        """
+        txt = str((args or {}).get('text') or '').strip()
+        if not txt:
+            return '没收到要念的内容（text 为空）'
+        self._voice_summary = txt[:600]
+        mode = str(getattr(self, 'voice_content_mode', 'summary') or 'summary')
+        if mode == 'manual':
+            return '已记下朗读摘要，但当前设置为「只念我选中的」，不会自动念'
+        if not getattr(self, 'voice_enabled', False):
+            return '已记下朗读摘要（朗读开关关着，不会出声）'
+        return '已记下朗读摘要：%s' % txt[:80]
+
+    def _speak_last_reply(self):
+        """手动朗读上一条回复（force：不受开关/夜间静音限制，用户主动要求就该出声）"""
+        txt = getattr(self, '_last_spoken_text', '') or ''
+        v = getattr(self, 'voice', None)
+        if not txt or v is None:
+            self._notify('还没有可朗读的回复')
+            return
+        if v.speak(txt, force=True):
+            self._notify('🔊 正在朗读上一条回复')
+
+    def _toggle_voice(self):
+        """开关「朗读 AI 回复」（写 config.json，立即生效）"""
+        want = not bool(getattr(self, 'voice_enabled', False))
+        if not self._save_cfg_value('voice_enabled', want):
+            return
+        self.voice_enabled = want
+        v = getattr(self, 'voice', None)
+        if v is not None:
+            v.set_config(enabled=want)
+        if not want and v is not None:
+            try:
+                v.stop()
+            except Exception:
+                pass
+        self._notify(('🔊 已开启朗读回复（%s；23:00–08:00 自动静音）'
+                      % self._voice_label(getattr(self, 'voice_name', '') or '')) if want
+                     else '🔇 已关闭朗读回复')
+
+    def _set_asr_backend(self, backend):
+        """设置语音识别后端（v6.77）：auto / winh / whisper / http"""
+        val = str(backend or '').strip().lower()
+        if val not in ('auto', 'winh', 'whisper', 'http'):
+            val = 'auto'
+        self.asr_backend = val
+        try:
+            self._save_cfg_value('asr_backend', val)
+        except Exception as e:
+            _silent_log('_set_asr_backend', e)
+        try:
+            self.asr.backend_name = val
+            self.asr._avail = None          # 换后端 → 能力缓存作废
+        except Exception:
+            pass
+        self._notify('语音识别后端：%s' % {'auto': '系统（WinRT→SAPI）', 'winh': '系统 Win+H 应急',
+                                          'whisper': '本地 whisper', 'http': '联网接口'}[val])
+        return val
+
+    def _set_asr_extra(self, **kw):
+        """改 whisper/http 后端的配置键（写 config + 同步到引擎）"""
+        mp = {'whisper_exe': 'asr_whisper_exe', 'whisper_model': 'asr_whisper_model',
+              'asr_http_url': 'asr_http_url', 'asr_http_key': 'asr_http_key',
+              'winh_hotkey': 'asr_winh_hotkey'}
+        for k, v in (kw or {}).items():
+            val = str(v or '').strip()
+            setattr(self, mp.get(k, k), val)
+            try:
+                self._save_cfg_value(mp.get(k, k), val)
+            except Exception as e:
+                _silent_log('_set_asr_extra', e)
+            try:
+                setattr(self.asr, k, val)
+            except Exception:
+                pass
+        return True
+
+    def _toggle_voice_night(self):
+        """夜间静音开关（23:00–08:00 不出声）"""
+        want = not bool(getattr(self, 'voice_night_quiet', True))
+        if not self._save_cfg_value('voice_night_quiet', want):
+            return
+        self.voice_night_quiet = want
+        v = getattr(self, 'voice', None)
+        if v is not None:
+            v.set_config(night_quiet=want)
+        self._notify('🌙 已开启夜间静音（23:00–08:00 不出声）' if want else '已关闭夜间静音')
+
+    def _set_voice_rate(self, rate):
+        """设置语速（v6.76）：写配置 + 立即生效（在线声线用百分比，离线换算成档位）"""
+        from voice_io import normalize_rate
+        val = normalize_rate(rate)
+        self.voice_rate = val
+        try:
+            self._save_cfg_value('voice_rate', val)
+        except Exception as e:
+            _silent_log('_set_voice_rate.save', e)
+        try:
+            self.voice.set_config(rate=val)
+        except Exception as e:
+            _silent_log('_set_voice_rate.apply', e)
+        try:
+            self._notify('语速：%s' % (val or '默认'))
+        except Exception:
+            pass
+        return val
+
+    def _voice_test(self, text):
+        """试听（v6.76）：用户主动点，忽略开关与夜间静音；先把当前语速推给引擎"""
+        try:
+            self.voice.set_config(rate=str(getattr(self, 'voice_rate', '') or ''))
+            ok = self.voice.speak(str(text or '试听'), force=True)
+            if not ok:
+                try:
+                    self._notify('试听没出声（看日志里的原因）')
+                except Exception:
+                    pass
+            return ok
+        except Exception as e:
+            _silent_log('_voice_test', e)
+            try:
+                self._notify('试听失败：%s' % e)
+            except Exception:
+                pass
+            return False
+
+    # ---------- v6.94：系统声线（慧慧/瑶瑶/康康）默认关闭 ----------
+    def _voice_label(self, spec):
+        """声线值 → 显示名（找不到就原样返回）"""
+        try:
+            return dict((k, lab) for k, lab, _e in self._voice_choices()).get(spec, spec)
+        except Exception as _exc:
+            _silent_log('_voice_label', _exc)
+            return spec
+
+    def _natural_voice_fallback(self):
+        """挑一条「人声级」声线：本地已装模型优先，其次在线晓晓（**永不返回 offline:**）"""
+        try:
+            import pet_voicelib
+            for key in ('zh-ll', 'fanchen-c', 'kokoro', 'melo-zh-en', 'theresa', 'eula'):
+                if pet_voicelib.is_installed(key):
+                    return pet_voicelib.spec(key, 0)
+        except Exception as _exc:
+            _silent_log('_natural_voice_fallback', _exc)
+        from voice_io import DEFAULT_VOICE
+        return DEFAULT_VOICE
+
+    def _migrate_system_voice(self):
+        """老配置里存的是系统声线（offline:Huihui）→ 换成自然声线并写回配置
+
+        为什么必须在启动时改：不改的话，升级后一朗读还是那个机械音，等于没关
+        （使用者就是这么发现「两套发声系统」的）。
+        """
+        if bool(getattr(self, 'voice_allow_system_tts', False)):
+            return False
+        from voice_io import parse_voice_spec
+        name = str(getattr(self, 'voice_name', '') or '')
+        if not name:
+            return False
+        eng, _v = parse_voice_spec(name)
+        if eng not in ('offline', 'winrt', 'sapi'):
+            return False
+        new = self._natural_voice_fallback()
+        self.voice_name = new
+        try:
+            if getattr(self, 'voice', None) is not None:
+                self.voice.set_config(voice=new)
+            self._save_cfg_value('voice_name', new)
+        except Exception as _exc:
+            _silent_log('_migrate_system_voice', _exc)
+        try:
+            self._notify('系统声线（慧慧/瑶瑶/康康 那套机械音）已关闭，朗读声线换成：%s'
+                         % self._voice_label(new))
+        except Exception:
+            pass
+        return True
+
+    def _set_voice_name(self, name):
+        """选声线（值形如 'edge:zh-CN-XiaoxiaoNeural' / 'offline:Huihui'）
+
+        v6.64：不再靠“字符串猜引擎”，而是把引擎+声线一起存进配置，默认在线声线。
+        """
+        from voice_io import parse_voice_spec, DEFAULT_VOICE
+        raw = str(name or '').strip()
+        if not raw or raw.startswith('自动'):
+            val = DEFAULT_VOICE
+        else:
+            eng, vname = parse_voice_spec(raw)
+            if eng in ('offline', 'winrt', 'sapi') and not bool(
+                    getattr(self, 'voice_allow_system_tts', False)):
+                # v6.94：系统声线已关 —— 选了也不生效，如实说清（别静默换成别的）
+                self._notify('系统声线（慧慧/瑶瑶/康康）已关闭：会把声音换成机械音，'
+                             '不再使用。要的话在 config.json 设 "voice_allow_system_tts": true')
+                return
+            val = '%s:%s' % (eng, vname) if vname else DEFAULT_VOICE
+        if not self._save_cfg_value('voice_name', val):
+            return
+        self.voice_name = val
+        v = getattr(self, 'voice', None)
+        if v is not None:
+            v.set_config(voice=val)
+        self._notify('朗读声线：%s' % self._voice_label(val))
+
+    def _set_voice_local(self, url=None, ref=None, prompt=None):
+        """设置本地自建 TTS 服务（v6.64）：地址 / 参考音频 / 参考文本"""
+        changed = []
+        for key, val in (('voice_local_url', url), ('voice_local_ref', ref),
+                         ('voice_local_prompt', prompt)):
+            if val is None:
+                continue
+            if self._save_cfg_value(key, str(val).strip()):
+                changed.append(key)
+        if url is not None:
+            self.voice_local_url = str(url).strip()
+        if ref is not None:
+            self.voice_local_ref = str(ref).strip()
+        if prompt is not None:
+            self.voice_local_prompt = str(prompt).strip()
+        v = getattr(self, 'voice', None)
+        if v is not None:
+            v.set_config(local_url=self.voice_local_url or '',
+                         local_ref=self.voice_local_ref or '',
+                         local_prompt=self.voice_local_prompt or '')
+        if changed:
+            self._notify('本地语音服务已保存；用「🔌 测试连接」确认它是否在跑')
+
+    # ---------- v6.66：语音输入（离线识别，结果只填入不发送） ----------
+    def _set_mic_button(self, listening):
+        try:
+            self.mic_btn.setText('⏺' if listening else '🎤')
+            self.mic_btn.setToolTip('正在听…（再点一次取消）' if listening else '语音输入（离线识别；再点一次取消）')
+        except Exception:
+            pass
+
+    def _toggle_listen(self):
+        """点 🎤：开始/取消语音输入（v6.77：按当前后端分发；winh 走“把系统拉起来”那条）"""
+        if getattr(self, '_listening', False):
+            try:
+                self.asr.cancel()
+            except Exception:
+                pass
+            self._listening = False
+            self._set_mic_button(False)
+            self._notify('🎤 已取消语音输入')
+            return
+        # winh 后端：不是我们自己识别，而是唤起系统 Win+H（结果由系统直接打进当前输入框）
+        if str(getattr(self.asr, 'backend_name', 'auto') or 'auto').lower() == 'winh':
+            try:
+                self.chat_input.setFocus()          # 焦点必须在输入框上，系统才会把字写进来
+            except Exception:
+                pass
+            _t, _c, _err = self.asr.trigger_win_h()
+            self._set_mic_button(False)
+            self._notify('🎤 %s' % str(_err or '已唤起 Win+H'))
+            return
+        ok, info = self.asr.available()
+        if not ok:
+            # 没能力时明确说原因，并给出替代方案（不静默失败）
+            self._notify('本机暂时不能语音识别（%s）；可用系统自带的 Win+H 语音输入' % str(info)[:40])
+            return
+        self._listening = True
+        self._set_mic_button(True)
+        self._notify('🎤 正在听…（说完停顿会自动结束；再点一次 🎤 可取消）')
+
+        def work():
+            try:
+                text, conf, err = self.asr.listen()
+            except Exception as e:
+                text, conf, err = '', '', '%s: %s' % (type(e).__name__, str(e)[:60])
+
+            def done():
+                self._listening = False
+                self._set_mic_button(False)
+                if err:
+                    self._notify('😶 没听清（%s）' % str(err)[:70])
+                    return
+                _txt = (text or '').strip()   # 别叫 text：与闭包变量同名会被当成局部变量
+                if not _txt:
+                    self._notify('😶 没听到内容，再试一次？')
+                    return
+                try:
+                    # 注意：聊天输入框是 QTextEdit 子类（_DropChatEdit）—— 没有 text()/setText()
+                    if hasattr(self.chat_input, 'toPlainText'):
+                        cur = self.chat_input.toPlainText().strip()
+                        self.chat_input.setPlainText((cur + ' ' + _txt) if cur else _txt)
+                    else:
+                        cur = self.chat_input.text().strip()
+                        self.chat_input.setText((cur + ' ' + _txt) if cur else _txt)
+                    self.chat_input.setFocus()
+                except Exception as _exc:
+                    _silent_log('_toggle_listen:fill', _exc)
+                self._notify('🎤 已填入输入框（确认后按回车发送）')
+            self._run_on_ui(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_model_help(self):
+        """“怎么接入自己的模型 / 自己的声音”说明（v6.64，给其他使用者看的）"""
+        from PySide6.QtWidgets import QMessageBox
+        txt = (
+            "【接入你自己的模型】\n"
+            "  设置 → 🎯 模型管理 → 新增档案，填：模型 ID、接口地址、API Key 所在配置项、价格。\n"
+            "  · 计价方式选“自动”：官方地址按峰谷算，第三方/中转按固定价（不会被误加倍）。\n"
+            "  · 非官方地址不支持余额查询；没填价格时费用记 0 并不计入（不会编数字）。\n"
+            "  · 官方改价时可用「💰 核对官方价格」一键比对（只提示，确认后才写入）。\n\n"
+            "【用你自己的声音】\n"
+            "  三种做法，从简单到折腾：\n"
+            "  1) 本地免费开源声线：设置 → 朗读声线 → 「🎚 本地声线库…」，8 个中文模型\n"
+            "     2000+ 音色，下载到本机、不联网（推荐，音质真人级）。\n"
+            "  2) 在线神经声线：填 edge:<声线名>（如 edge:zh-CN-XiaoyiNeural），\n"
+            "     「🌐 列出在线声线」可挑；不需要 Key、不计费，但要联网。\n"
+            "  3) 你自己的模型（训练/克隆好的）：在本机把它跑成一个 HTTP 服务，\n"
+            "     在「本地服务地址」填 http://127.0.0.1:端口 → 「🔌 测试连接」，\n"
+            "     再把声线设为 local:<那个地址>。\n"
+            "     约定：POST {地址}/tts 返回音频（兼容 GPT-SoVITS 的 api_v2 / CosyVoice / ChatTTS）；\n"
+            "     想用自己的音色，填「参考音频」+「参考文本」即可做零样本克隆。\n\n"
+            "【降级顺序】本地模型 ↔ 在线神经声线，两者都不行就安静并报原因。\n"
+            "  v6.94 起**不再降级到 Windows 系统声线**（慧慧/瑶瑶/康康 那套机械音，\n"
+            "  使用者反馈“一朗读就换成人机”）。真想要：config.json 里\n"
+            "  \"voice_allow_system_tts\": true。\n"
+            "详细说明见项目 README 的「接入你自己的模型 / 自己的声音」一节。")
+        QMessageBox.information(self, '接入说明', txt)
+
+    def _test_local_tts(self):
+        """测试本地自建 TTS 服务是否在线（后台线程，不卡界面）"""
+        import threading
+        url = (getattr(self, 'voice_local_url', '') or '').strip()
+        if not url:
+            self._notify('先填「本地服务地址」，例如 http://127.0.0.1:9880')
+            return
+        self._notify('正在测试本地语音服务…')
+
+        def work():
+            from voice_io import probe_local_service
+            ok, info = probe_local_service(url)
+            msg = ('✅ 本地语音服务在跑（%s）—— 把声线设成 local:%s 就能用它念' % (info, url)
+                   if ok else '❌ 连不上：%s' % info)
+            self._run_on_ui(lambda: self._notify(msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _voice_choices(self):
+        """声线清单（给设置窗口用；值为 '引擎:声线'）
+
+        v6.92：末尾追加**已下载的本地预训练声线**（sherpa:模型/说话人号）。
+        多说话人模型只给 5 个代表音色 —— 804 个全塞下拉框没法用；
+        想要别的，去「🎚 本地声线库」搜索/试听。
+        v6.94：`offline:`（慧慧/瑶瑶/康康）默认整条过滤掉 —— 机械音，不再出现在列表里。
+        """
+        out = list(_VOICE_CHOICES)
+        if not bool(getattr(self, 'voice_allow_system_tts', False)):
+            out = [c for c in out if not str(c[0]).startswith('offline:')]
+        try:
+            import pet_voicelib
+            out.extend(pet_voicelib.choices())
+        except Exception as _exc:
+            _silent_log('_voice_choices', _exc)
+        return tuple(out)
+
+    def open_voice_library(self, parent=None):
+        """打开「本地声线库」面板（v6.92）：挑模型 → 挑音色（搜索/试听/应用）→ 缺的模型一键下载
+
+        懒创建：没点过就不会去碰 sherpa-onnx，也不会扫磁盘。
+        """
+        try:
+            import pet_voicelib
+            import pet_voice_ui
+            if not pet_voicelib.installed():
+                self._notify('本地还没有声线模型（面板里可一键下载，8 个模型约 1.2 GB）')
+            return pet_voice_ui.open_library(self, parent or self)
+        except Exception as _exc:
+            _silent_log('open_voice_library', _exc)
+            self._notify('本地声线库打不开：%s' % _exc)
+            return None
+
+    def _voice_edit_apply(self, text):
+        """应用「自定义声线」输入框的内容（v6.64）
+
+        允许的写法（顺序不敏感）：
+        - `edge:<微软声线名>`（任意语言都行，如 zh-CN-XiaoyiNeural / en-US-AriaNeural）
+        - `sherpa:<模型>/<说话人号>`（本地声线库里的声线）
+        - `local:http://…`（自建 TTS 服务）
+        v6.94：`offline:<系统声线名>` 默认被拒绝 —— 那是慧慧/瑶瑶/康康那套机械音。
+        """
+        from voice_io import parse_voice_spec
+        raw = str(text or '').strip()
+        if not raw:
+            self._notify('请先填一个声线名，或从「列出…声线」里选')
+            return
+        eng, name = parse_voice_spec(raw)
+        if not name:
+            self._notify('认不出这个声线名：%s' % raw[:40])
+            return
+        if eng in ('offline', 'winrt', 'sapi') and not bool(
+                getattr(self, 'voice_allow_system_tts', False)):
+            self._notify('系统声线（WinRT/SAPI：慧慧/瑶瑶/康康）已关闭 —— 想用请在 config.json 里'
+                         '设 "voice_allow_system_tts": true；平时推荐 `edge:` 或本地声线库')
+            return
+        self._set_voice_name('%s:%s' % (eng, name))
+
+    def _list_voices_dialog(self, kind, parent=None):
+        """列举可选声线（后台线程，不卡界面）：kind = 'system' | 'edge'"""
+        import threading
+        from PySide6.QtWidgets import QInputDialog
+        if kind == 'system' and not bool(getattr(self, 'voice_allow_system_tts', False)):
+            # v6.94：系统声线整套关了，就别再让用户挑出个机械音
+            self._notify('系统声线（慧慧/瑶瑶/康康）已关闭 —— 朗读只用在线/本地声线；'
+                         '想恢复：config.json 里 "voice_allow_system_tts": true')
+            return
+        self._notify('正在获取声线列表…')
+
+        def work():
+            items = []
+            try:
+                from voice_io import list_system_voices, list_edge_voices
+                if kind == 'system':
+                    items = list_system_voices(getattr(self.voice, 'ps1', ''))
+                else:
+                    items = list_edge_voices()
+            except Exception as _exc:
+                _silent_log('_list_voices_dialog', _exc)
+
+            def show():
+                if not items:
+                    self._notify('没取到声线（离线列表读不到；在线需联网）' if kind == 'system'
+                                 else '没取到在线声线（需联网，或未打包 edge_tts）')
+                    return
+                labels = [lab for _spec, lab in items]
+                pick, ok = QInputDialog.getItem(parent or self, '选择朗读声线',
+                                                '挑一个（选中后会自动填入声线条）：',
+                                                labels, 0, False)
+                if ok and pick:
+                    for spec, lab in items:
+                        if lab == pick:
+                            self._set_voice_name(spec)
+                            break
+            self._run_on_ui(show)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- v6.93：朗读暂停 / 继续 ----------
+    def _toggle_voice_pause(self):
+        """⏸ ↔ ▶ 二态切换（输入框那颗按钮、右键菜单都走这里）"""
+        v = getattr(self, 'voice', None)
+        if v is None:
+            return
+        if getattr(v, 'is_paused', lambda: False)():
+            ok = v.resume()
+            self._notify('▶ 继续朗读' if ok else '没有在朗读')
+        else:
+            ok = v.pause()
+            self._notify('⏸ 已暂停朗读 —— 再点一下继续（这一句停在原处，后面的句子不丢）'
+                         if ok else '现在没有在朗读')
+        self._apply_voice_pause_btn()
+
+    def _apply_voice_pause_btn(self):
+        """按实际播放状态刷按钮：暂停中显示 ▶，没在念就把按钮灰掉（只在变化时动控件）"""
+        btn = getattr(self, 'voice_pause_btn', None)
+        if btn is None:
+            return
+        v = getattr(self, 'voice', None)
+        playing = bool(getattr(v, 'is_playing', lambda: False)()) if v is not None else False
+        paused = bool(getattr(v, 'is_paused', lambda: False)()) if v is not None else False
+        want_text = '▶' if paused else '⏸'
+        want_enabled = bool(playing or paused)
+        if want_enabled:
+            want_tip = '继续朗读（再点一下接着念）' if paused else '暂停朗读（再点一下继续）'
+        else:
+            want_tip = '现在没有在朗读'
+        if btn.text() != want_text:
+            btn.setText(want_text)
+        if btn.isEnabled() != want_enabled:
+            btn.setEnabled(want_enabled)
+        if btn.toolTip() != want_tip:
+            btn.setToolTip(want_tip)
+
+    def _test_voice(self):
+        """试听一句（force：不受开关限制，方便选声线）"""
+        v = getattr(self, 'voice', None)
+        if v is None:
+            return
+        sample = '你好呀，我是%s，这是当前的朗读声线。' % CHARACTERS.get(
+            getattr(self, 'current', 'flash'), {}).get('name', '桌宠')
+        if v.speak(sample, force=True):
+            self._notify('🔊 正在试听…')
+        else:
+            self._notify('试听失败：%s' % (getattr(v, 'last_error', '') or '未知原因'))
+
+    # ---- v6.62：节假日表（峰谷计价用；不消耗搜索额度） ----
+    HOLIDAYS_CACHE = os.path.join(BASE_DIR, 'holidays_cache.json')
+
+    def _maybe_update_holidays(self):
+        """当年没表时静默拉一次（一年最多一次；失败就用内置表，不打扰用户）"""
+        try:
+            import cn_holidays as ch
+            year = datetime.datetime.now().year
+            if ch.has_year(year, self.HOLIDAYS_CACHE) or not getattr(self, 'holidays_auto_update', True):
+                return
+            threading.Thread(target=lambda: ch.update_from_remote([year], self.HOLIDAYS_CACHE),
+                             daemon=True).start()
+        except Exception as _exc:
+            _silent_log('_maybe_update_holidays', _exc)
+
+    def _update_holidays_now(self):
+        """手动更新节假日表（主跨年/发现算错时用；公共静态 JSON，无 key 无额度）"""
+        import threading
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        self._notify('正在更新节假日表…' if not is_en else 'Updating holiday table…')
+
+        def work():
+            import cn_holidays as ch
+            year = datetime.datetime.now().year
+            years = [y for y in (year - 1, year, year + 1)]
+            ok, errs = ch.update_from_remote(years, self.HOLIDAYS_CACHE)
+            msg = ('节假日表已更新：%s' % '、'.join('%d 年' % y for y in ok))
+            if errs:
+                msg += '；未取到：' + '；'.join(errs)
+            self._run_on_ui(lambda: self._notify(msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_temperature(self, val):
+        """设置采样温度（写进当前角色的模型档案）"""
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        if not self._save_profile_param('temperature', val):
+            return
+        self._notify((f'采样温度：{val}' if not is_en else f'Temperature: {val}')
+                          + ('（已写入模型档案）' if not is_en else ' (saved to model profile)'))
+
+    def _set_temperature_dialog(self):
+        """自定义采样温度"""
+        from PySide6.QtWidgets import QInputDialog
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        text, ok = QInputDialog.getText(self, self._t('temperature'),
+            ('输入 0.0 ~ 2.0（越小越稳，越大越发散）：' if not is_en
+             else 'Enter 0.0 ~ 2.0 (lower = steadier):'),
+            text=str(getattr(self, 'temperature', 1.0)))
+        if ok and text.strip():
+            try:
+                self._set_temperature(max(0.0, min(float(text.strip()), 2.0)))
+            except ValueError:
+                self._notify('请输入数字。' if not is_en else 'Please enter a number.')
+
+    def _on_models_saved(self):
+        """模型档案落盘后热加载：刷新角色表 / 模型 ID / 参数"""
+        self._load_ai_config()
+
+    def _open_model_manager(self):
+        """打开模型管理对话框：增删档案 / 改显示名与模型 ID / 拉官方列表 / 连通性自检"""
+        dlg = ModelManagerDialog(MODEL_REGISTRY,
+                                 key_resolver=self._api_key_for_field,
+                                 parent=self)
+        dlg.saved.connect(self._on_models_saved)
+        dlg.exec()
+        self._load_ai_config()      # 关闭后再刷一次（覆盖新增/删除档案的情况）
+
+    def _set_personality_dialog(self):
+        """弹窗自定义性格"""
+        from PySide6.QtWidgets import QInputDialog
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        text, ok = QInputDialog.getText(self, self._t('dlg_personality'),
+            '输入性格描述（如：傲娇毒舌的学姐）：' if not is_en else 'Enter personality description (e.g. sarcastic senior):', text=self.personality)
+        if ok and text.strip():
+            if self._save_cfg_value('personality', text.strip()):
+                self._notify(f'性格设置为：{text.strip()}' if not is_en else f'Personality set to: {text.strip()}')
+
+    def _set_personality(self, p):
+        """切换性格（预设，写入配置持久保存）"""
+        p = p.strip()
+        if p in ['温柔', '傲娇', '吐槽', '元气', '高冷']:
+            self._save_cfg_value('personality', p)
+            self._notify(f'性格切换为：{p}（已保存）')
+        else:
+            self._notify('可选性格：温柔/傲娇/吐槽/元气/高冷')
+
+    def switch_char(self, key):
+        """切换角色（每个角色独立的对话历史 + 独立模型）"""
+        if key not in CHARACTERS or key == self.current:
+            return
+        # 保存当前角色的对话历史
+        self._save_chat_memory()
+        self.load_character(key)
+        self.ai_model = self._current_model()
+        # 加载新角色的独立历史，刷新面板
+        self.chat_history_msgs = []
+        self._clear_chat_history()
+        self._load_chat_memory()
+        self._notify(f'已切换到 {CHARACTERS[key]["name"]}（模型：{self.ai_model}）——这是 {CHARACTERS[key]["name"]} 的独立对话')
+
+    def toggle_edge_mode(self):
+        """切换贴边模式：扒边 ↔ 完全消失"""
+        self._edge_mode = 'hidden' if self._edge_mode == 'peek' else 'peek'
+        mode_name = '完全消失' if self._edge_mode == 'hidden' else '扒边'
+        self._notify(f'贴边模式切换为：{mode_name}')
+        if self._edge_side is not None:
+            self._edge_popped = False
+            self._enter_dock(self._edge_side, self._popup_y)
+
+    # ---------- 音效 ----------
+    def _play_sound(self, kind):
+        """播放提示音（v6.73 批次3：收口到平台抽象层）"""
+        pl.beep(kind)
+
+    # ---------- 贴边交互（双模式） ----------
+    def _edge_dock_check(self):
+        """贴边：扒边模式=显示扒边立绘双击弹出；完全消失模式=鼠标靠近边缘弹出"""
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        geo = screen.geometry()
+        w, h = self.width(), self.height()
+
+        # 拖拽时不贴边
+        if self.dragging:
+            if self._edge_side is not None:
+                self._edge_side = None
+                self._edge_popped = False
+            return
+
+        x, y = self.x(), self.y()
+        mouse_x, mouse_y = QCursor.pos().x(), QCursor.pos().y()
+        y_near = (y - 120) <= mouse_y <= (y + h + 120)
+
+        if self._edge_side is None:
+            # ===== 自由态：按人物（pet_label）位置判断吸附，而非整个窗口 =====
+            # pet_label 在布局中水平居中、垂直顶部
+            pet_left = x + (self.width() - self.pet_size) // 2
+            pet_right = pet_left + self.pet_size
+            pet_bottom = y + self.pet_size
+            # 注：顶部贴边已按用户要求移除；只保留左/右/下
+            if pet_bottom >= geo.bottom() - 18:
+                self._enter_dock('bottom', y)
+            elif pet_left <= 18:
+                self._enter_dock('left', y)
+            elif pet_right >= geo.right() - 18:
+                self._enter_dock('right', y)
+        else:
+            side = self._edge_side
+            if self._edge_mode == 'hidden':
+                self._hidden_mode_logic(side, x, y, w, h, mouse_x, mouse_y, y_near, geo)
+            else:
+                self._peek_mode_logic(side, x, y, w, h, mouse_x, mouse_y, geo)
+
+    def _exit_dock_to_free(self):
+        """解除贴边，恢复正常待机（拖出/右键时用；v6.19d 窗口跟随面板+屏幕钳制，防截断）"""
+        self._edge_side = None
+        self._edge_popped = False
+        if self._chat_hidden_for_dock:
+            self.chat_panel.show()
+            self._chat_hidden_for_dock = False
+            try:
+                self.chat_input.setFixedHeight(34)
+                self.chat_input.setMinimumHeight(34)
+            except Exception:
+                pass
+        self._sync_window_to_panel()
+        self.pet_label.setFixedSize(self.pet_size, self.pet_size)
+        self._restore_display_state()
+
+    def _popup_from_dock(self):
+        """从贴边弹出完整窗口（双击/右键用；v6.19d 窗口跟随面板+屏幕钳制）"""
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        geo = screen.geometry()
+        side = self._edge_side
+        if self._chat_hidden_for_dock and not self.chat_panel.isVisible():
+            self.chat_panel.show()
+            self._chat_hidden_for_dock = False
+            try:
+                self.chat_input.setFixedHeight(34)
+                self.chat_input.setMinimumHeight(34)
+            except Exception:
+                pass
+        self._sync_window_to_panel()
+        if side in ('left', 'right'):
+            pop_x = 0 if side == 'left' else geo.right() - self.width()
+            pop_y = max(geo.top(), min(self._popup_y, geo.bottom() - self.height()))
+            self.move(pop_x, pop_y)
+        else:
+            pop_y = 0 if side == 'top' else geo.bottom() - self.height()
+            pop_x = max(geo.left(), min(self._popup_x, geo.right() - self.width()))
+            self.move(pop_x, pop_y)
+        self._edge_popped = True
+        self._restore_display_state()
+
+    def _enter_dock(self, side, y):
+        """进入贴边（立即收缩）"""
+        self._edge_side = side
+        self._popup_y = y
+        self._popup_x = self.x()
+        self._edge_popped = False
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        geo = screen.geometry()
+        if self.chat_panel.isVisible():
+            self._chat_hidden_for_dock = True
+            self.chat_panel.hide()
+        # v6.51：扒边后窗口只剩立绘宽，气泡显示出来也是被裁的残句，直接收起来
+        if getattr(self, 'bubble', None) is not None and self.bubble.isVisible():
+            self.bubble.hide()
+        if self._edge_mode == 'peek':
+            # 扒边模式：窗口贴边缘，显示对应方向的扒边立绘（坐标保护：窗口完全在屏幕内）
+            if side in ('left', 'right'):
+                # 竖构图：窗口缩到立绘宽度，贴左/右缘
+                dock_w = self.pet_size
+                dock_h = self.pet_size + 80    # v6.81：跟着人物大小走，别把大立绘裁掉
+                self.setFixedSize(dock_w, dock_h)
+                dock_x = 0 if side == 'left' else geo.right() - dock_w
+                dock_y = max(0, min(y, geo.bottom() - dock_h))
+                self.move(dock_x, dock_y)
+            else:
+                # 横构图：窗口贴底缘
+                self.setFixedSize(440, 300)
+                dock_x = max(0, min(self._popup_x, geo.right() - 440))
+                self.move(dock_x, geo.bottom() - 300)
+            # 显示扒边立绘（带方向）
+            self._show_peek()
+        else:
+            # 完全消失模式：移出屏幕只露 1px（窗口主体在屏幕外，仅边缘可触发弹出）
+            self.setFixedSize(440, self._win_h())
+            if side == 'left':
+                self.move(-440 + 1, max(0, min(y, geo.bottom() - 340)))
+            elif side == 'right':
+                self.move(geo.right() - 1, max(0, min(y, geo.bottom() - 340)))
+            else:
+                self.move(max(0, min(self._popup_x, geo.right() - 440)), geo.bottom() - 1)
+
+    def _restore_window_size(self):
+        """恢复完整窗口大小（v6.19d 窗口跟随面板+屏幕钳制，防截断）"""
+        self._sync_window_to_panel()
+
+    def _peek_mode_logic(self, side, x, y, w, h, mouse_x, mouse_y, geo):
+        """扒边模式：双击弹出（mouseDoubleClickEvent 处理），此处只保持贴边"""
+        # 保持贴边位置 + 强制显示扒边立绘（防止被眨眼/动画覆盖）
+        if not self._edge_popped:
+            if side in ('left', 'right'):
+                dock_w = self.width()
+                dock_x = 0 if side == 'left' else geo.right() - dock_w
+                dock_y = max(0, min(self._popup_y, geo.bottom() - self.height()))
+                self.move(dock_x, dock_y)
+            else:
+                dock_h = self.height()
+                dock_x = max(0, min(self._popup_x, geo.right() - self.width()))
+                self.move(dock_x, geo.bottom() - dock_h)
+            self._show_peek()
+
+    def _hidden_mode_logic(self, side, x, y, w, h, mouse_x, mouse_y, y_near, geo):
+        """完全消失模式：鼠标靠近边缘弹出；移开后不立即收回（允许选中/点击）"""
+        dock_margin = 40
+        leave_margin = 90
+        if side == 'left':
+            mouse_near = mouse_x <= leave_margin
+            pop_x, pop_y = 0, self._popup_y
+            dock_x, dock_y = -w + 1, self._popup_y
+        elif side == 'right':
+            mouse_near = mouse_x >= geo.right() - leave_margin
+            pop_x, pop_y = geo.right() - w, self._popup_y
+            dock_x, dock_y = geo.right() - 1, self._popup_y
+        elif side == 'top':
+            mouse_near = mouse_y <= leave_margin
+            pop_x, pop_y = self._popup_x, 0
+            dock_x, dock_y = self._popup_x, -h + 1
+        else:  # bottom
+            mouse_near = mouse_y >= geo.bottom() - leave_margin
+            pop_x, pop_y = self._popup_x, geo.bottom() - h
+            dock_x, dock_y = self._popup_x, geo.bottom() - 1
+
+        if self._edge_popped:
+            # ===== 已弹出：鼠标在窗口上或靠近边缘 → 保持；否则收回 =====
+            mouse_in_win = (pop_x - 30 <= mouse_x <= pop_x + w + 30
+                            and pop_y - 40 <= mouse_y <= pop_y + h + 40)
+            if mouse_near or mouse_in_win:
+                self.move(pop_x, pop_y)
+            else:
+                # 收回
+                if self.chat_panel.isVisible():
+                    self._chat_hidden_for_dock = True
+                    self.chat_panel.hide()
+                    self.setFixedSize(440, self._win_h())
+                self.move(dock_x, dock_y)
+                self._edge_popped = False
+        else:
+            # ===== 未弹出：靠近边缘弹出 =====
+            if mouse_near and y_near:
+                target_y = max(0, min(mouse_y - h // 2, geo.bottom() - h))
+                target_x = max(0, min(mouse_x - w // 2, geo.right() - w))
+                if side in ('left', 'right'):
+                    self._popup_y = target_y
+                    self.move(pop_x, target_y)
+                else:
+                    self._popup_x = target_x
+                    self.move(target_x, pop_y)
+                self._edge_popped = True
+                if self._chat_hidden_for_dock and not self.chat_panel.isVisible():
+                    self.chat_panel.show()
+                    self.setFixedSize(440, self._win_h())
+                    self._chat_hidden_for_dock = False
+            # 彻底离开（远离边缘且鼠标不在附近）→ 退出贴边
+            if side == 'left':
+                left_edge = not (mouse_x <= dock_margin)
+            elif side == 'right':
+                left_edge = not (mouse_x >= geo.right() - dock_margin)
+            elif side == 'top':
+                left_edge = not (mouse_y <= dock_margin)
+            else:
+                left_edge = not (mouse_y >= geo.bottom() - dock_margin)
+            if left_edge and not y_near:
+                self._edge_side = None
+                self._edge_popped = False
+
+    # ---------- 动画 ----------
+    def animate(self):
+        # 贴边检查（非拖拽时）
+        self._edge_dock_check()
+        # v6.30 fix：贴边未弹出时完全静止（不做摆头移动，避免与贴边定位冲突导致左右抽动）
+        if self._edge_side is not None and not self._edge_popped:
+            return
+        # 待机/拖拽/睡眠：完全静止，不重绘不移动（杜绝闪烁）
+        if self.state == 'idle' or self.sleeping or self.dragging:
+            return
+        # 思考/开心：轻微左右摆头（只动位置，不重绘图片）
+        self.phase += 1
+        dx = int(3 * math.sin(self.phase * 0.25))
+        if self.base_x is None:
+            self.base_x = self.x()
+        if self.base_y is None:
+            self.base_y = self.y()
+        self.move(self.base_x + dx, self.base_y)
+
+    # ---------- 睡眠 ----------
+    def toggle_sleep(self):
+        """睡眠切换（实现已搬至 pet_anim.toggle_sleep）"""
+        return anim.toggle_sleep(self)
+    # ---------- 连击 ----------
+    def _on_click(self):
+        import time
+        now = time.time()
+        self.click_times.append(now)
+        self.click_times = [t for t in self.click_times if now - t < 0.8]
+        if len(self.click_times) >= 3:
+            self.click_times = []
+            self._special_reaction()
+        else:
+            self._click_reaction()
+
+    # 反应立绘停留多久（毫秒）；调大调小都改这里
+    REACTION_HOLD_MS = 3000
+
+    def _click_reaction(self):
+        """单击立绘：从反应表里随机挑一个（换立绘 + 说一句；v6.78）
+
+        反应表在 pet_reactions.REACTIONS，加台词只改那张表。"""
+        i = reactions.pick(getattr(self, '_last_reaction', -1))
+        self._last_reaction = i
+        asset_key, zh, en = reactions.REACTIONS[i]
+        if self.sleeping:
+            anim.toggle_sleep(self)      # v6.78：戳一下就醒（否则睡着时点了只出声不换图）
+        if getattr(self, 'language', 'zh') == 'en':
+            self.say_plain(en)
+        else:
+            self.say_plain(zh)
+        if not asset_key or getattr(self, 'display_mode', 'static') == 'live2d':
+            return          # 只说话：不换图（Live2D 模式由模型代替）
+        img = self._get_state_img(asset_key)
+        if img is None or img.isNull():
+            return
+        self.state = 'reaction'
+        self.phase = 0
+        self._render_frame(img)
+        QTimer.singleShot(self.REACTION_HOLD_MS, lambda: self._end_state('reaction'))
+
+    def _special_reaction(self):
+        if self.current == 'pro':
+            # v6.51：补上 state——原先只换立绘不设状态，若此刻有眨眼在途，
+            # _blend_end 会按 state=='idle' 把立绘提前刷回待机（与普通角色分支行为不一致）
+            self.state = 'scared'
+            self.phase = 0
+            self._show_state_image('scared')
+            lines = self._char_lines('scared_lines')
+            self.say_plain(random.choice(lines) if lines else 'Ah!')
+            QTimer.singleShot(2500, lambda: self._end_state('scared'))
+        else:
+            self.state = 'happy'
+            self.phase = 0
+            self._show_state_image('happy')
+            lines = self._char_lines('happy_lines')
+            self.say_plain(random.choice(lines) if lines else 'Yay!')
+            QTimer.singleShot(2500, lambda: self._end_state('happy'))
+
+    def _end_state(self, st):
+        """临时状态收尾（实现已搬至 pet_anim.end_state）"""
+        return anim.end_state(self, st)
+    # ---------- 鼠标 ----------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # 扒边贴边状态：按下即解除贴边，恢复正常待机，允许拖出
+            if self._edge_side is not None and self._edge_mode == 'peek' and not self._edge_popped:
+                self._exit_dock_to_free()
+                self._drag_from_dock = True
+            else:
+                self._drag_from_dock = False
+            self.dragging = True
+            self._press_pt = event.globalPosition().toPoint()   # v6.78：区分点击与拖动
+            self.drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.dragging and (event.buttons() & Qt.LeftButton):
+            self.move(event.globalPosition().toPoint() - self.drag_offset)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self.dragging:
+            self.dragging = False
+            self.base_x, self.base_y = self.x(), self.y()
+            self._save_position()
+            # v6.78：只要按下到抬起没怎么动就算"点击"——包括从扒边竖条一戳；
+            # 真的拖走（位移 > 10px）才不触发反应
+            pt = getattr(self, '_press_pt', None)
+            moved = (event.globalPosition().toPoint() - pt).manhattanLength() if pt is not None else 0
+            self._drag_from_dock = False
+            if moved <= 10:
+                self._on_click()
+        event.accept()
+
+    def paintEvent(self, event):
+        """显式填充透明背景（不调用 super，避免 QWidget 默认绘制 palette 背景色覆盖透明）"""
+        p = QPainter(self)
+        p.fillRect(self.rect(), Qt.transparent)
+        p.end()
+
+    def mouseDoubleClickEvent(self, event):
+        # 扒边贴边时双击 → 弹出
+        if self._edge_side is not None and self._edge_mode == 'peek' and not self._edge_popped:
+            if QApplication.primaryScreen():
+                self._popup_from_dock()
+                return
+        self.say_random()
+
+    # ---------- 托盘 ----------
+    def hide_to_tray(self):
+        self.hide()
+        self._ensure_tray()
+        if self.tray:
+            msg = f'{CHARACTERS[self.current]["name"]} 已最小化到托盘，双击图标回来。' if getattr(self, 'language', 'zh') != 'en' else f'{CHARACTERS[self.current]["name"]} minimized to tray. Double-click the icon to return.'
+            self.tray.showMessage(
+                'DeepSeek 桌宠',
+                msg,
+                QSystemTrayIcon.Information, 2000
+            )
+
+    def _ensure_tray(self):
+        if hasattr(self, 'tray') and self.tray is not None:
+            return self.tray
+        icon = QIcon(self.full_idle.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip('DeepSeek 桌宠助手')
+        tray_menu = QMenu()
+        show_act = tray_menu.addAction('🏠 显示桌宠' if getattr(self, 'language', 'zh') != 'en' else '🏠 Show pet')
+        # 角色项由模型档案生成（新增档案即出现，无需改代码）
+        for _pk in MODEL_REGISTRY.keys():
+            _prof = MODEL_REGISTRY.get(_pk)
+            _act = tray_menu.addAction(_prof.display_name if _prof else _pk)
+            _act.triggered.connect(lambda checked=False, k=_pk: self.switch_char(k))
+        tray_menu.addSeparator()
+        quit_act = tray_menu.addAction('✕ 退出' if getattr(self, 'language', 'zh') != 'en' else '✕ Exit')
+        show_act.triggered.connect(self.show_pet)
+        quit_act.triggered.connect(self.quit_app)
+        self.tray.setContextMenu(tray_menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+        return self.tray
+
+    def _tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_pet()
+
+    def show_pet(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self._save_position()
+        # v6.82：退出时收掉 mpv 与 Node 插件宿主，别留孤儿进程
+        try:
+            if getattr(self, '_music', None) is not None:
+                self._music.shutdown()
+        except Exception as _exc:
+            _silent_log('quit_app:music', _exc)
+        # v6.85：退出时把还在跑的下载任务停掉（yt-dlp 会留下 .part，下次续传）
+        try:
+            if getattr(self, '_download', None) is not None:
+                self._download.shutdown()
+        except Exception as _exc:
+            _silent_log('quit_app:download', _exc)
+        # v6.86：退出时把还在跑的转换任务停掉（已经转好的文件留着）
+        try:
+            if getattr(self, '_convert', None) is not None:
+                self._convert.shutdown()
+        except Exception as _exc:
+            _silent_log('quit_app:convert', _exc)
+        if self._hotkey_installed:
+            try:
+                pl.unregister_hotkey(1)
+            except Exception:
+                pass
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        self.hide_to_tray()
+        event.ignore()
+
+    # ---------- 开机自启 ----------
+    # ---------- 开机自启（v6.72 批次2：实现收编到 platform_layer）----------
+    def is_autostart_enabled(self):
+        """启动文件夹里有没有自启快捷方式"""
+        return pl.autostart_enabled()
+
+    def toggle_autostart(self):
+        """开关开机自启：实现交给平台抽象层，UI 提示留在宿主
+
+        历史 bug：旧实现删完文件后写 `if True: … else: …`，恒真 → 只会关不会开
+        （打开自启的代码是死代码）。现在用显式 set(on)，返回新状态。
+        """
+        on, ok, msg = pl.autostart_toggle()
+        if not ok:
+            self._notify(f'自启设置失败：{msg}')
+            self.say_plain(f'自启设置失败: {msg}', immediate=True)
+            return on
+        if on:
+            self._notify('✅ 开机自启已开启（启动文件夹快捷方式）')
+            self.say_plain('已开启开机自启', immediate=True)
+        else:
+            self._notify('❌ 开机自启已关闭（下次开机需手动启动桌宠）')
+            self.say_plain('已关闭开机自启', immediate=True)
+        return on
+
+    # ---------- 随机动作 ----------
+    # ============ 主动关心系统（v6.18 链式+回访） ============
+    @staticmethod
+    def _user_idle_minutes():
+        """用户空闲分钟数（拆至 care_engine.user_idle_minutes）"""
+        return user_idle_minutes()
+
+    def _ai_wakeup_judge(self):
+        """链式唤醒判断（网络/解析拆至 care_engine.judge_wakeup，此处组装状态+注入用量记录）"""
+        try:
+            import datetime as _dt
+            now = _dt.datetime.now()
+            last_chat = ''
+            if self.chat_history_msgs:
+                last_chat = (self.chat_history_msgs[-1].get('content') or '')[:80]
+            idle = self._user_idle_minutes()
+            week = '一二三四五六日'[now.weekday()]
+            state = f'现在是{now.strftime("%H:%M")}（周{week}），电脑空闲 {idle:.0f} 分钟'
+            if last_chat:
+                state += f'，最近对话：{last_chat}'
+            # v6.60 批 4：把最近两条「我主动说过的话」也给模型，避免反复说同类内容
+            try:
+                _cares = [m for m in self.memories.all(self.current)
+                          if str(m.get('title', '')).startswith(('主动关心', '提醒', '问候'))]
+                if _cares:
+                    _recent = '；'.join(str(m.get('detail') or m.get('title'))[:28] for m in _cares[-2:])
+                    state += f'，最近我主动说过：{_recent}（换个角度，不要重复）'
+            except Exception:
+                pass
+            return judge_wakeup(
+                self._current_api_key(), self._current_model(), state,
+                CHARACTERS[self.current]['name'],
+                record_cb=self._record_api_usage,
+                endpoint=self._current_endpoint(),
+                # v6.59：仅在用户显式开启「前台程序感知」时才附带信号（默认 None 不影响原逻辑）
+                busy_hint=(pl.busy_hint() if getattr(self, 'foreground_aware', False) else None),
+            )
+        except Exception:
+            return None
+
+    def _wakeup_worker(self):
+        """唤醒判断线程：结果决定是否冒泡 + 更新下次唤醒间隔（链式）"""
+        interval = None
+        try:
+            j = self._ai_wakeup_judge()
+            if j:
+                try:
+                    interval = max(10, min(int(j.get('next_minutes', 60)), 360)) * 60
+                except Exception:
+                    interval = None
+                if j.get('act') == 'yes' and j.get('message'):
+                    self.wakeup_signal.emit(j['message'].strip())
+        finally:
+            if interval is None:
+                interval = random.uniform(480, 1200)
+            self._active_chat_next = time.time() + interval
+
+    def _display_wakeup(self, msg):
+        """主线程槽：主动关心以浮动气泡显示，不写入对话历史（v6.19 不再污染聊天记录）"""
+        if not msg:
+            return
+        display, emotion = self._strip_emotion_tag(msg)
+        if emotion:
+            self._apply_emotion(emotion)
+        # v6.60 批 3：主动关心走独立「关心气泡」（左侧色条 + 可点开接话 + 入回忆日志）
+        self.say_care(display, kind='care')
+        self._care_mark()   # v6.60 批 4：计入冷却与每日上限
+
+    def _ai_followup(self, topic):
+        """回访机制（消息生成拆至 care_engine.followup_message，此处组装状态+发信号）"""
+        def work():
+            try:
+                import datetime as _dt
+                now = _dt.datetime.now()
+                idle = self._user_idle_minutes()
+                last_chat = ''
+                if self.chat_history_msgs:
+                    last_chat = (self.chat_history_msgs[-1].get('content') or '')[:60]
+                week = '一二三四五六日'[now.weekday()]
+                state = f'现在是{now.strftime("%H:%M")}（周{week}），用户已空闲 {idle:.0f} 分钟'
+                if last_chat:
+                    state += f'，最近对话：{last_chat}'
+                msg = followup_message(
+                    self._current_api_key(), self._current_model(), state, topic,
+                    CHARACTERS[self.current]['name'],
+                    record_cb=self._record_api_usage,
+                    endpoint=self._current_endpoint(),
+                )
+                if msg:
+                    self.wakeup_signal.emit(msg)
+            except Exception:
+                pass
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- v6.60 批 4：关心的节流 / 场景触发 / 措辞多样化 ----
+    CARE_COOLDOWN_MIN = 20           # 两次主动关心最短间隔（分钟）
+    CARE_DAILY_MAX = 8               # 每日上限（次）
+    CARE_SCENE_WINDOW = (30, 300)    # 「休息间隙」判定窗口（秒）
+
+    def _is_night(self, hour=None):
+        """深夜静默（23:00–8:00）——与链式判断提示词里的规则一致，改为硬约束"""
+        h = datetime.datetime.now().hour if hour is None else int(hour)
+        return h >= 23 or h < 8
+
+    def _care_allowed(self):
+        """三重节流：深夜静默 / 冷却 / 每日上限。返回 (是否允许, 原因)"""
+        if self._is_night():
+            return False, '深夜静默'
+        if time.time() - getattr(self, '_care_last_at', 0) < self.CARE_COOLDOWN_MIN * 60:
+            return False, '冷却中（%d 分钟内已关心过）' % self.CARE_COOLDOWN_MIN
+        day = datetime.datetime.now().strftime('%Y-%m-%d')
+        st = getattr(self, '_care_today', None)
+        if not st or st.get('date') != day:
+            st = {'date': day, 'n': 0}
+            self._care_today = st
+        if int(st.get('n', 0)) >= self.CARE_DAILY_MAX:
+            return False, '已达当日上限 %d 次' % self.CARE_DAILY_MAX
+        return True, ''
+
+    def _care_mark(self):
+        """记一次关心（冷却与每日上限用）。注：内存计数，重启会重置（不写用户 config）"""
+        self._care_last_at = time.time()
+        day = datetime.datetime.now().strftime('%Y-%m-%d')
+        st = getattr(self, '_care_today', None)
+        if not st or st.get('date') != day:
+            st = {'date': day, 'n': 0}
+        st['n'] = int(st.get('n', 0)) + 1
+        self._care_today = st
+
+    def _note_foreground(self, proc):
+        """采样前台程序类别（仅前台感知开启时调用）——用于「休息间隙」场景触发"""
+        try:
+            cat = pl.foreground_categorize(proc) or 'other'
+        except Exception:
+            return
+        prev = getattr(self, '_fg_cat', '')
+        if cat == prev:
+            return
+        self._fg_cat = cat
+        if prev in ('code', 'office', 'meeting', 'game', 'video') and cat in ('browser', 'terminal', 'other'):
+            self._fg_break_at = time.time()   # 从专注切到不表态 → 视为休息间隙
+            self._scene_used = False
+
+    def _scene_ready(self):
+        """休息间隙是否可用于提前关心（窗口 30–300 秒内、本次间隙未用过）"""
+        if not getattr(self, 'foreground_aware', False):
+            return False
+        if getattr(self, '_scene_used', True):
+            return False
+        lo, hi = self.CARE_SCENE_WINDOW
+        return lo <= (time.time() - getattr(self, '_fg_break_at', 0)) <= hi
+
+    def _pick_care_line(self, kind='care'):
+        """兜底关心措辞：从措辞库取一句，且与上一条不重复（v6.60 批 4）"""
+        lang = 'en' if getattr(self, 'language', 'zh') == 'en' else 'zh'
+        line = care_engine.pick_fallback(lang, kind, getattr(self, '_last_care_line', ''))
+        if line:
+            self._last_care_line = line
+        return line
+
+    # ---- v6.61：扒边探头（可选开关 + 看门狗兜底） ----
+    # 背景：v6.60 批 3 把「探头」写在 _check_active_chat 开头，导致节流不通过的轮次
+    #      也先把窗口弹出来、随后直接 return —— 没有气泡就永远不会走收回路径，
+    #      桌宠停在全尺寸弹出态（用户反馈「缩回一会儿又自己弹出来」）。
+    # 现在：① 探头挪到「确认要说话」之后；② 探头只在本开关开启时发生；
+    #      ③ 探头即挂看门狗，超时未说话强制收回。
+    PROBE_WATCHDOG_MS = 60000        # 探头后若这么久还没说出话 → 强制收回
+
+    def set_dock_probe(self, on):
+        """设置「扒边时弹出来说」开关（落盘 + 热加载）"""
+        self.dock_probe = bool(on)
+        self._save_cfg_value('dock_probe', self.dock_probe)
+        self._notify('扒边探头：%s' % ('已开启（说关心时整个人弹出）' if self.dock_probe
+                                       else '已关闭（只冒气泡，不弹人）'))
+
+    def toggle_dock_probe(self):
+        self.set_dock_probe(not bool(getattr(self, 'dock_probe', False)))
+
+    def _probe_from_dock(self):
+        """扒边探头（v6.61）：仅「扒边 + 未弹出 + 开关开启」时把窗口弹出来。
+
+        返回是否已探头。开关关闭时不弹人 —— 关心气泡照旧显示在扒边窗口里
+        （_place_bubble 按窗口实际宽度夹过，长句不会被硬裁）。
+        """
+        docked = (self._edge_side is not None and self._edge_mode == 'peek'
+                  and not self._edge_popped)
+        if not docked or not bool(getattr(self, 'dock_probe', False)):
+            return False
+        try:
+            self._popup_from_dock()
+            self._dock_rehide = True
+            self._probe_timer.start(self.PROBE_WATCHDOG_MS)
+            log.info('扒边探头：弹出说话（%d 秒内无消息将自动收回）', self.PROBE_WATCHDOG_MS // 1000)
+            return True
+        except Exception as e:
+            log.debug('扒边探头失败，本轮改为只冒气泡：%s', e)
+            return False
+
+    def _rehide_after_probe(self):
+        """探头后收回扒边（v6.61：收回路径收敛，_hide_bubble 与看门狗共用）"""
+        self._dock_rehide = False
+        try:
+            self._probe_timer.stop()
+        except Exception:
+            pass
+        if self._edge_side is None:
+            return
+        try:
+            self._enter_dock(self._edge_side, self._popup_y)
+            log.info('扒边探头：已缩回扒边')
+        except Exception as e:
+            log.debug('探头收回失败：%s', e)
+
+    def _probe_watchdog(self):
+        """探头看门狗（v6.61）：到点仍没说出话（收回标记还在）→ 强制收回
+
+        覆盖「AI 判定这次不说话 / 线程异常 / 文本为空」等拿不到气泡的分支。
+        """
+        if not getattr(self, '_dock_rehide', False):
+            return
+        log.info('扒边探头：超时未说话，自动收回')
+        self._rehide_after_probe()
+
+    def _check_active_chat(self):
+        """主动关心检查（v6.60 批 4；v6.61 修正探头顺序并加看门狗）
+
+        触发：① 到点（链式唤醒给的间隔）；② 场景触发——前台程序从「专注」切到浏览器/桌面，
+              在 30–300 秒窗口内视为休息间隙（仅开启前台感知时生效）。
+        节流：深夜静默 / 冷却 20 分钟 / 每日上限 8 次；未通过则顺延并记 debug 日志。
+        扒边：v6.61 起「先判断要不要说话，再决定探头」——节流不通过的轮次不再碰窗口几何；
+              探头只在「扒边探头」开关开启时发生，关闭时只在边上冒气泡（见 _probe_from_dock）。
+        """
+        if not self.active_chat_enabled or self.sleeping:
+            return
+        now = time.time()
+        if getattr(self, 'foreground_aware', False):
+            self._note_foreground(pl.foreground_process())
+        scene = self._scene_ready()
+        if now < self._active_chat_next and not scene:
+            return
+        ok, why = self._care_allowed()
+        if not ok:
+            log.debug('本次关心跳过：%s', why)
+            if now >= self._active_chat_next:
+                self._active_chat_next = now + 300   # 节流中：5 分钟后再看
+            return
+        if scene:
+            self._scene_used = True
+            log.info('场景触发：检测到休息间隙（前台类别 %s）', getattr(self, '_fg_cat', '?'))
+        # v6.61：到这里才确认「这一轮真的要说话」→ 此刻才考虑探头
+        # （原先探头写在函数开头：节流不通过时弹出了却无话可说，且永远不会收回）
+        self._probe_from_dock()
+        if self.ai_enabled:
+            import threading
+            threading.Thread(target=self._wakeup_worker, daemon=True).start()
+        else:
+            # AI 不可用：兜底措辞（v6.60 批 4：从措辞库取，且不与上一条重复）
+            line = self._pick_care_line('rest')
+            if line:
+                self.say_care(line, kind='care')
+                self._care_mark()
+            self._active_chat_next = now + random.uniform(480, 1200)
+
+    def toggle_active_chat(self):
+        """开关主动关心（链式+回访，AI 自主调度唤醒）"""
+        self.active_chat_enabled = not self.active_chat_enabled
+        self._save_cfg_value('active_chat', self.active_chat_enabled)
+        state = '已开启' if self.active_chat_enabled else '已关闭'
+        mode = 'AI 智能判断（链式唤醒+回访）' if self.active_chat_enabled else ''
+        self._notify(f'主动关心{state}{mode}')
+        self.say_plain(f'主动关心{state}', immediate=True)
+
+    def _run_plugin_menu(self, command):
+        """执行 menu 类插件的菜单命令（v6.22，结果用气泡提示不污染对话）"""
+        result = self.plugin_mgr.handle_menu(command)
+        if result:
+            self.say_plain(str(result), immediate=True)
+
+    def _chat_with_ai(self):
+        """聚焦聊天输入框"""
+        if not self.ai_enabled:
+            self._append_chat('桌宠', '还没配置 AI 呢！在 config.json 里加 deepseek_api_key 就能和我聊天了')
+            return
+        self.chat_input.setFocus()
+
+    def random_action(self):
+        """随机做一个动作（说话/思考/场景动作），保证与上次不重复"""
+        import random as rnd
+        candidates = ['say', 'think'] + list(SCENE_ACTIONS.keys())
+        last = getattr(self, '_last_random', None)
+        if last in candidates and len(candidates) > 1:
+            candidates.remove(last)
+        pick = rnd.choice(candidates)
+        self._last_random = pick
+        if pick == 'say':
+            self.say_random()
+        elif pick == 'think':
+            self.do_thinking()
+        else:
+            self.play_scene(pick)
+
+    # ---------- 好感度关系面板（v6.30） ----------
+    def _open_relation(self):
+        # v6.90：已经开着就**还原+置前**，不再关掉重建（否则用户按了「—」隐藏后，
+        # 再点一次菜单会把窗口关了重开，等于把隐藏变成了销毁）
+        old = getattr(self, '_relation_dialog', None)
+        if old is not None:
+            try:
+                pwin.present(old)
+                return
+            except RuntimeError:
+                self._relation_dialog = None
+        self._relation_dialog = RelationDialog(
+            self.affection, self.current, CHARACTERS[self.current]['name'])
+        pwin.present(self._relation_dialog)
+
+    # ---------- 好感度 Phase2 交互（v6.30） ----------
+    def _handle_affection(self, result, role=None):
+        """好感度事件结果统一处理：里程碑自动记录回忆 + 头顶提示"""
+        if not result or result.get('blocked'):
+            return
+        role = role or self.current
+        notes = []
+        if result.get('leveled_up'):
+            notes.append(f'等级提升到 Lv.{result["new_level"]}')
+        if result.get('stage_changed'):
+            notes.append(f'关系进入「{result["new_stage"]}」阶段')
+        for t in result.get('unlocked_titles') or []:
+            notes.append(f'获得称号「{t}」')
+        if notes:
+            try:
+                self.memories.add(role, 'milestone', '；'.join(notes),
+                                  affection_at=self.affection.snapshot(role)['affection'])
+            except Exception:
+                pass
+            self._show_pet_bubble('、'.join(notes) + '！', 4)
+
+    def _show_pet_bubble(self, text, secs=3):
+        """角色头顶提示气泡（复用 CostBubble 动画）
+
+        v6.61：① 说话/关心气泡也贴在窗口顶部 y≈6，若它正在显示，把本气泡下移，
+        不再叠在一起；② 先静止再渐隐（hold），否则渐变全程扫过、根本读不清。
+        """
+        try:
+            b = CostBubble(self, text, self._tk('ui_green'))
+            x = max(8, self.width() // 2 - len(text) * 6)
+            y = 8
+            try:
+                speaking = bool(getattr(self, '_speak_busy', False)) or self.bubble.isVisible()
+                if speaking and self.bubble.height() > 0:
+                    y = min(max(8, self.height() - 44),
+                            self.bubble.y() + self.bubble.height() + 6)
+            except Exception:
+                pass
+            b.show_bubble(x, y, duration=secs * 1000, hold_ms=max(1200, int(secs * 500)))
+        except Exception:
+            pass
+
+    def _on_cost_bubble(self, cost):
+        """API 费用提示（v6.30 浮动气泡 → v6.61 底部状态条）
+
+        使用者反馈（2026-09-19）：浮动气泡固定在窗口顶部 y=8，**与说话气泡重叠**；
+        且 1.4 秒全程渐隐，金额看不清。现改走底部状态条通道（系统提示通道）：
+        位置不冲突、停留 6 秒、并带上今日累计，信息更完整。
+        """
+        try:
+            today = getattr(self.api_stats, 'today', {}) or {}
+            bal = ''
+            try:
+                bal = self.api_stats.balance_text()   # v6.61：有缓存则附上余额
+            except Exception:
+                bal = ''
+            msg = '本次 −¥%.4f · 今日 ¥%.2f / %d 次%s' % (
+                float(cost or 0), float(today.get('cost') or 0), int(today.get('count') or 0),
+                (' · 余额 ' + bal) if bal else '')
+            self._notify(msg, ms=self.COST_NOTIFY_MS)
+        except Exception as e:
+            log.debug('费用提示失败：%s', e)
+
+    # ---- v6.61：余额查询（手动 / 对话后静默刷新 / 低余额提醒） ----
+    BALANCE_LOW_DEFAULT = 5.0        # 低余额提醒阈值（元），可在设置里手改
+    BALANCE_NOTIFY_MS = 8000         # 余额类提示停留时长
+
+    def set_balance_low(self, value):
+        """设置低余额提醒阈值（元）；0 表示关闭提醒"""
+        try:
+            val = max(0.0, min(float(value), 100000.0))
+        except Exception:
+            return False
+        self.balance_low_threshold = val
+        self._save_cfg_value('balance_low_threshold', val)
+        self._notify('低余额提醒：%s' % ('已关闭' if val <= 0 else '低于 ¥%.2f 时提醒' % val))
+        return True
+
+    def _query_balance_async(self, manual=True):
+        """后台查询余额（不阻塞 UI）；结果经 balance_signal 回主线程
+
+        manual=False（对话后自动）时全程静默：不弹状态条，失败也不打扰。
+        """
+        if getattr(self, '_balance_busy', False):
+            return False
+        try:
+            key = self._current_api_key()
+        except Exception:
+            key = getattr(self, 'ai_key', '')
+        if not key:
+            if manual:
+                self._notify('余额：未配置 API Key', ms=self.COST_NOTIFY_MS)
+            return False
+        try:
+            base = self._current_endpoint()
+        except Exception:
+            base = ''
+        # v6.79 fix：第三方中转没有 /user/balance 这个接口，硬查只会得到 HTTP 401/404，
+        # 用户看到「余额查询失败：HTTP 401」还以为是 key 坏了。中转时直接说明，不再发请求。
+        try:
+            from model_registry import is_official_endpoint
+            if base and not is_official_endpoint(base):
+                if manual:
+                    self._notify('💰 余额查询不可用：当前是第三方中转接口'
+                                 '（请到中转站后台查看余额）', ms=self.BALANCE_NOTIFY_MS)
+                return False
+        except Exception as e:
+            log.debug('余额接口官方性判断失败：%s', e)
+        self._balance_busy = True
+
+        def work():
+            try:
+                info = ApiStats.query_balance(key, base)
+            except Exception as e:
+                info = {'ok': False, 'error': str(e)[:120]}
+            info = dict(info)
+            info['_manual'] = bool(manual)
+            try:
+                self.balance_signal.emit(info)
+            except Exception:
+                pass
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _on_balance_result(self, info):
+        """余额查询结果回主线程（v6.61）：缓存 + 提示 + 低余额提醒"""
+        info = dict(info or {})
+        manual = bool(info.pop('_manual', False))
+        self._balance_busy = False
+        try:
+            self.api_stats.set_balance(info if info.get('ok') else None)
+        except Exception as e:
+            log.debug('余额缓存写入失败：%s', e)
+        if info.get('ok'):
+            txt = ''
+            try:
+                txt = self.api_stats.balance_text(True)
+            except Exception:
+                txt = ''
+            log.info('余额查询成功：%s', txt)
+            if manual:
+                self._notify('💰 余额 %s' % (txt or '—'), ms=self.BALANCE_NOTIFY_MS)
+            self._maybe_low_balance_alert(info)
+        else:
+            log.debug('余额查询失败：%s', info.get('error'))
+            if manual:
+                self._notify('余额查询失败：%s' % (info.get('error') or '未知错误'),
+                             ms=self.COST_NOTIFY_MS)
+
+    def _maybe_low_balance_alert(self, info):
+        """余额低于阈值提醒一次（每天最多一次）；阈值可在设置里手改"""
+        try:
+            thr = float(getattr(self, 'balance_low_threshold', self.BALANCE_LOW_DEFAULT) or 0)
+            total = info.get('total')
+            if thr <= 0 or total is None or float(total) >= thr:
+                return
+            today = datetime.datetime.now().strftime('%Y-%m-%d')
+            if getattr(self, '_balance_alerted', '') == today:
+                return
+            self._balance_alerted = today
+            self._notify('⚠️ 余额偏低：¥%.2f（阈值 ¥%.2f）— 建议充值' % (float(total), thr),
+                         ms=self.BALANCE_NOTIFY_MS)
+        except Exception as e:
+            log.debug('低余额提醒失败：%s', e)
+
+    def _feed_pet(self):
+        """喂食：恢复饱食度 + 好感（冷却 30 分钟）"""
+        r = self.affection.feed(self.current)
+        if r.get('blocked'):
+            self._show_pet_bubble('刚喂过啦，过会儿再喂～')
+            return
+        self._handle_affection(r)
+        try:
+            self._show_state_image('kiss')  # v6.30 喂食成功：撒娇亲亲
+        except Exception:
+            pass
+        self._show_pet_bubble(f'好吃！饱食度 {r.get("satiety", 100):.0f}%，好感 +2')
+
+    def _open_games(self):
+        """打开小游戏窗口"""
+        # v6.90：开着就还原+置前（原先每次都关掉重建，「—」隐藏等于白按）
+        old = getattr(self, '_game_window', None)
+        if old is not None:
+            try:
+                pwin.present(old)
+                return
+            except RuntimeError:
+                self._game_window = None
+        self._publish_theme()   # v6.58 先发布主题再开窗口
+        self._game_window = GameWindow(self._on_game_result, self)
+        pwin.present(self._game_window)
+
+    def _on_game_result(self, win, score=0, game=None):
+        """小游戏结果 → 好感度事件 + 高分里程碑 + 动作状态图"""
+        try:
+            r = self.affection.trigger(self.current, 'game_win' if win else 'game_play')
+            self._handle_affection(r)
+            # 高分里程碑（v6.30）：破纪录 → 庆祝 + 回忆 + 额外好感
+            if game and score:
+                try:
+                    rec = self.affection.record_best(self.current, game, score)
+                    if rec['is_record']:
+                        self.memories.add(
+                            self.current, 'milestone', f'「{game}」新纪录 {score} 分',
+                            f'打破了之前 {rec["prev"]} 分的纪录',
+                            affection_at=self.affection.snapshot(self.current)['affection'])
+                        self._show_pet_bubble(f'🏆 「{game}」新纪录 {score} 分！', 4)
+                        self.affection.trigger(self.current, 'chat')  # 破纪录额外好感
+                except Exception as _exc:
+                    _silent_log('_on_game_result:5867', _exc)   # v6.54
+            try:
+                self._show_state_image('victory' if win else 'defeat')
+            except Exception as _exc:
+                _silent_log('_on_game_result:5871', _exc)   # v6.54
+            if win:
+                self.play_scene('happy')
+        except Exception as _exc:
+            _silent_log('_on_game_result:5875', _exc)   # v6.54
+
+    def _check_satiety(self):
+        """饱食度巡检：低饱食切饥饿状态图 + 提示（零惩罚，不扣好感；每小时最多提示一次）"""
+        try:
+            s = self.affection.satiety(self.current)
+            if s < 30:
+                # v6.30 饥饿状态图（素材已应用后生效）
+                try:
+                    self._show_state_image('hungry')
+                except Exception:
+                    pass
+                if time.time() - getattr(self, '_last_satiety_warn', 0) > 3600:
+                    self._last_satiety_warn = time.time()
+                    self._show_pet_bubble('肚子好饿…喂我吃点东西嘛 (｡•́︿•̀｡)')
+        except Exception:
+            pass
+
+    # ---------- 情感选项（galgame 选择支，v6.30 Phase3b） ----------
+    def _render_choices(self):
+        """把待展示的选项按钮追加到 AI 回复的同一气泡（打字机完成后调用）"""
+        choices = getattr(self, '_pending_choices', None) or []
+        if not choices:
+            return
+        self._pending_choices = None
+        if self.chat_type_timer.isActive():
+            # 打字机还在渲染正文：等完成回调（_chat_type_tick）再追加，避免按钮插在文本中间
+            return
+        content = getattr(self, '_chat_type_content', None)
+        if content is None:
+            import datetime as _dt
+            ts = _dt.datetime.now().strftime('%m-%d %H:%M')
+            _, content = self._new_bubble('桌宠', ts, is_user=False, text='')
+        self._add_choice_buttons(content, choices)
+        self._chat_scroll_bottom()
+
+    def _add_choice_buttons(self, content, choices):
+        """在指定气泡内容区添加选项按钮（A/B/C，带情感标签 ❤️+n）"""
+        letters = ['A', 'B', 'C']
+        for i, c in enumerate(choices):
+            if isinstance(c, dict):
+                label = c.get('text', '')
+                aff = c.get('affect')
+                tag = f'  ❤️+{aff}' if aff else ''
+            else:
+                label = str(c)
+                tag = ''
+            btn = QPushButton(f'{letters[i]}. {label}{tag}')
+            self._set_themed_qss(btn, lambda: (          # v6.58 主题化
+                'QPushButton { background:%s; color:%s; border:1px solid %s;'
+                ' border-radius:8px; padding:8px 12px; text-align:left; font-size:13px; }'
+                'QPushButton:hover { background:%s; border-color:%s; }'
+                'QPushButton:disabled { background:%s; color:%s; border-color:%s; }'
+                % (self._tk('ui_btn_bg'), self._tk('ui_text'), self._tk('ui_border'),
+                   self._tk('ui_btn_hover'), self._tk('ui_accent'),
+                   self._tk('ui_btn_disabled'), self._tk('ui_text_muted'), self._tk('ui_btn_alt'))))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda checked, c=c, b=btn: self._send_choice(c, b))
+            content.addWidget(btn)
+
+    def _send_choice(self, choice, btn=None):
+        """用户点击选项：禁用整组按钮防止重复选择，作为用户消息发送 + 好感度 +1(+affect)"""
+        if isinstance(choice, dict):
+            text = choice.get('text', '')
+            aff = choice.get('affect')
+        else:
+            text = str(choice)
+            aff = None
+        if btn is not None:
+            try:
+                parent = btn.parentWidget()
+                if parent is not None:
+                    for b in parent.findChildren(QPushButton):
+                        b.setEnabled(False)
+            except Exception:
+                pass
+        try:
+            if aff:
+                # 情感增量：额外触发对应好感度（affect 次 chat 事件近似，或直接按数值加成）
+                for _ in range(min(3, int(aff))):
+                    self.affection.trigger(self.current, 'chat')
+            else:
+                self.affection.trigger(self.current, 'chat')
+        except Exception:
+            pass
+        self._append_chat('我', text)
+        self.chat_history_msgs.append({'role': 'user', 'content': text})
+        self._save_chat_memory()
+        self.ask_ai(text)
+
+    # ---------- 回忆相册（v6.30 Phase3） ----------
+    def _open_memories(self):
+        dlg = MemoriesDialog(self.memories, self.current, CHARACTERS[self.current]['name'], self,
+                             searcher=self._search_memories)   # v6.63：相册里可搜共同经历
+        dlg.exec()
+
+    def _search_memories(self, query, top_k=8):
+        """v6.63：本地检索「记住的事 + 共同经历」（不调 LLM、不花 API）"""
+        from memory_search import search_memories
+        return search_memories(self.memory_facts, self.memories.all(self.current),
+                               query, top_k=top_k)
+
+    def _recall_text(self, query):
+        """v6.63：把搜索结果整理成一段话（供 /回忆 与相册共用）"""
+        from memory_search import format_hits
+        is_en = getattr(self, 'language', 'zh') == 'en'
+        try:
+            res = self._search_memories(query)
+            return format_hits(res, is_en=is_en)
+        except Exception as e:
+            return ('回忆检索失败：%s' % str(e)[:80]) if not is_en else ('Recall search failed: %s' % str(e)[:80])
+
+    def _open_settings(self, page=0):
+        """打开统一设置窗口（page 指定初始分类）"""
+        dlg = SettingsDialog(self, MODEL_REGISTRY, parent=self)
+        try:
+            if 0 <= int(page) < dlg.nav.count():
+                dlg.nav.setCurrentRow(int(page))
+        except Exception:
+            pass
+        dlg.exec()
+        self._load_ai_config()      # 关掉后再热加载一次，菜单/角色表立即反映改动
+
+    def _build_context_menu(self):
+        """构建右键菜单，返回 (menu, acts)。
+        拆成独立方法是为了能单独校验菜单内容（menu.exec 会阻塞，无法直接测）。
+
+        Phase 5 重构：一级从 10 项压到 6 项——「动作」留在互动、「配置」收进设置窗口、
+        角色/性格/立绘合并为「形象」、关系与用量合并为「状态」。
+        功能一个不删，设置窗口里都能找到。"""
+        T = self._t
+        menu = QMenu(self)
+        menu.setStyleSheet("QMenu { font-size: 13px; }")
+        acts = {}
+
+        # 1. 和 AI 聊天（最高频，置顶）
+        acts['chat'] = menu.addAction(T('menu_chat'))
+
+        # 1.5 v6.82：音乐（MusicFree 插件音源 + 头顶歌词）
+        acts['music'] = menu.addAction('🎵 音乐…')
+        acts['music'].triggered.connect(lambda: self.open_music_panel())
+
+        # 1.6 v6.85：一键下载（yt-dlp 内核，B站/YouTube/抖音… 一千多个站）
+        acts['download'] = menu.addAction('⬇ 下载视频…')
+        acts['download'].triggered.connect(lambda: self.open_download_panel())
+
+        # 1.7 v6.86：文件转换（Filee CLI 优先，内置引擎兜底）
+        acts['convert'] = menu.addAction('⇄ 文件转换…')
+        acts['convert'].triggered.connect(lambda: self.open_convert_panel())
+
+        # 1.8 v6.88：见面照片墙（每次见面 = 一面拍立得墙；记录每一次见面）
+        acts['photos'] = menu.addAction('📷 见面照片墙…')
+        acts['photos'].triggered.connect(lambda: self.open_photo_wall())
+        acts['photo_card'] = menu.addAction('🖼 见面小卡片')
+        acts['photo_card'].triggered.connect(lambda: self.open_photo_card())
+
+        # 1.9 v6.89：记账（说一句「午饭 32」就记一笔；面板看月度报表与预算）
+        acts['ledger'] = menu.addAction(self._t('lg_menu'))
+        acts['ledger'].triggered.connect(lambda: self.open_ledger())
+
+        # 1.10 v6.95：异地（TA 的城市天气 + 两城直线距离 + 突变提醒）
+        acts['longdist'] = menu.addAction('🌤 异地天气与距离…')
+        acts['longdist'].triggered.connect(lambda: self.open_long_distance())
+
+        # 2. 互动：只放「做一件事」（动作 / 玩法 / 开关）
+        imenu = menu.addMenu(T('menu_interact'))
+        imenu.addAction(T('say')).triggered.connect(lambda: self.say_random())
+        imenu.addAction(T('think')).triggered.connect(lambda: self.do_thinking())
+        imenu.addAction(T('random')).triggered.connect(lambda: self.random_action())
+        imenu.addSeparator()
+        imenu.addAction('🍖 喂食').triggered.connect(self._feed_pet)
+        imenu.addAction('🎮 小游戏').triggered.connect(self._open_games)
+        imenu.addSeparator()
+        imenu.addAction(T('sleep')).triggered.connect(lambda: self.toggle_sleep())
+        imenu.addAction(T('toggle_chat')).triggered.connect(lambda: self.toggle_chat_panel())
+        # v6.80：右键也能新开对话（找不到标题栏按钮时的备用入口）
+        imenu.addAction(T('new_chat')).triggered.connect(lambda: self._new_conversation())
+        imenu.addSeparator()
+        # v6.63：语音朗读（P0）
+        act_voice = imenu.addAction('🔊 朗读开关' + (T('on') if getattr(self, 'voice_enabled', False) else T('off')))
+        act_voice.setCheckable(True)
+        act_voice.setChecked(bool(getattr(self, 'voice_enabled', False)))
+        act_voice.triggered.connect(lambda *_: self._toggle_voice())
+        imenu.addAction('🗣️ 朗读上一条回复').triggered.connect(self._speak_last_reply)
+        imenu.addAction('⏸ 暂停 / ▶ 继续朗读').triggered.connect(self._toggle_voice_pause)  # v6.93
+        imenu.addAction('🎤 语音输入').triggered.connect(self._toggle_listen)   # v6.66
+        imenu.addSeparator()
+        # 场景动作：原先「常用 5 个 + 更多动作 7 个」两级嵌套，合并成一层 12 项
+        scene_menu = imenu.addMenu('🎬 场景动作')
+        for sk, (label, _desc) in SCENE_ACTIONS.items():
+            scene_menu.addAction(label).triggered.connect(lambda checked, k=sk: self.play_scene(k))
+        imenu.addSeparator()
+        act_active = imenu.addAction(
+            T('active_care') + (T('on') if self.active_chat_enabled else T('off')))
+        act_active.setCheckable(True)
+        act_active.setChecked(bool(self.active_chat_enabled))
+        act_active.triggered.connect(lambda: self.toggle_active_chat())
+        # v6.61：扒边探头（默认关 —— 扒边时说关心只在边上冒气泡，不把整个人弹出来）
+        act_probe = imenu.addAction(
+            '🪟 扒边时弹出来说' + ('（已开启）' if getattr(self, 'dock_probe', False) else '（已关闭）'))
+        act_probe.setCheckable(True)
+        act_probe.setChecked(bool(getattr(self, 'dock_probe', False)))
+        act_probe.triggered.connect(lambda: self.toggle_dock_probe())
+
+        # 3. 形象：角色 / 立绘 / 性格（合并原「角色」「性格切换」与立绘模式）
+        fmenu = menu.addMenu('🎭 形象')
+        # 角色项由模型档案生成（新增档案即出现，无需改代码）
+        for _pk in MODEL_REGISTRY.keys():
+            _prof = MODEL_REGISTRY.get(_pk)
+            _ra = fmenu.addAction(_prof.display_name if _prof else _pk)
+            _ra.setCheckable(True)
+            _ra.setChecked(_pk == self.current)
+            _ra.triggered.connect(lambda checked=False, k=_pk: self.switch_char(k))
+        fmenu.addSeparator()
+        # v6.81：大小 / 透明度（面板隐藏、只留立绘时也能从这里改）
+        fmenu.addAction(T('pet_style_menu')).triggered.connect(lambda: self._open_appearance_dialog())
+        ma_static = fmenu.addAction(T('mode_static'))
+        ma_static.setCheckable(True)
+        ma_static.setChecked(getattr(self, 'display_mode', 'static') != 'live2d')
+        ma_static.triggered.connect(lambda: self._set_display_mode('static'))
+        ma_l2d = fmenu.addAction(T('mode_live2d'))
+        ma_l2d.setCheckable(True)
+        ma_l2d.setChecked(getattr(self, 'display_mode', 'static') == 'live2d')
+        ma_l2d.triggered.connect(lambda: self._set_display_mode('live2d'))
+        fmenu.addSeparator()
+        pmenu = fmenu.addMenu(T('menu_personality'))
+        for pk, pl in [('温柔', 'person_gentle'), ('傲娇', 'person_tsundere'),
+                       ('吐槽', 'person_sarcastic'), ('元气', 'person_energetic'),
+                       ('高冷', 'person_cold')]:
+            pmenu.addAction(T(pl)).triggered.connect(lambda checked, pp=pk: self._set_personality(pp))
+        fmenu.addSeparator()
+        # v6.51：主题切换入口（此前只有 AI 工具 set_theme 能切，用户自己没有入口）
+        thmenu = fmenu.addMenu('🎨 主题')
+        _cur_theme = str(getattr(self, 'current_theme', 'default') or 'default')
+        try:
+            _theme_names = ['default'] + [str(x) for x in self.plugin_mgr.theme_names()]
+        except Exception:
+            _theme_names = ['default']
+        for _tn in _theme_names:
+            _ta = thmenu.addAction('默认（深色）' if _tn == 'default' else _tn)
+            _ta.setCheckable(True)
+            _ta.setChecked(_tn == _cur_theme)
+            _ta.triggered.connect(lambda checked=False, t=_tn: self.apply_theme_named(t))
+        fmenu.addSeparator()
+        fmenu.addAction('🎯 更多形象设置…').triggered.connect(lambda: self._open_settings(2))
+
+        # 4. 贴边模式（状态开关，留在一级）
+        acts['edgemode'] = menu.addAction(
+            T('edge_mode') + (T('edge_hidden') if self._edge_mode == 'peek' else T('edge_peek')))
+
+        # 5. 状态：关系 + 用量统计（合并原「关系」与「工具」里的统计项）
+        stmenu = menu.addMenu('📊 状态')
+        stmenu.addAction('❤️ 与 %s 的关系' % CHARACTERS[self.current]['name']).triggered.connect(
+            self._open_relation)
+        stmenu.addAction('📖 回忆相册').triggered.connect(self._open_memories)
+        stmenu.addSeparator()
+        umenu = stmenu.addMenu('📈 API 用量')
+        umenu.addAction('📊 统计悬浮窗').triggered.connect(lambda: self._toggle_api_stats_window())
+        umenu.addAction('💰 查询余额').triggered.connect(lambda: self._query_balance_async(True))
+        umenu.addAction('📈 按模型统计').triggered.connect(self._show_model_stats)
+        umenu.addAction('🔄 查看统计历史').triggered.connect(self._show_api_stats_history)
+
+        # 6. 设置…（统一设置窗口，替代原来的 40+ 项设置子菜单）
+        acts['settings'] = menu.addAction('⚙️ 设置…')
+        acts['settings'].triggered.connect(self._open_settings)
+
+        # 7. 插件（有 menu 类插件时才出现，避免空项占位）
+        plugin_menu_items = self.plugin_mgr.menu_items()
+        if plugin_menu_items:
+            plmenu = menu.addMenu('🔌 插件')
+            for label, cmd, _pname in plugin_menu_items:
+                plmenu.addAction('%s' % label).triggered.connect(
+                    lambda checked, c=cmd: self._run_plugin_menu(c))
+
+        menu.addSeparator()
+        acts['hide'] = menu.addAction(T('hide_tray'))
+        menu.addSeparator()
+        acts['exit'] = menu.addAction(T('exit'))
+        return menu, acts
+    def contextMenuEvent(self, event):
+        # 扒边贴边状态：右键 = 弹出（锁定其他功能）
+        if self._edge_side is not None and self._edge_mode == 'peek' and not self._edge_popped:
+            self._popup_from_dock()
+            return
+        menu, acts = self._build_context_menu()
+        chosen = menu.exec(event.globalPos())
+        if chosen == acts['chat']:
+            self._chat_with_ai()
+        elif chosen == acts['edgemode']:
+            self.toggle_edge_mode()
+        elif chosen == acts['hide']:
+            self.hide_to_tray()
+        elif chosen == acts['exit']:
+            self.quit_app()
+
+    def _set_language(self, lang):
+        """切换界面语言（zh/en），保存并热加载"""
+        if lang not in ('zh', 'en'):
+            return
+        if self._save_cfg_value('language', lang):
+            # 更新输入框 placeholder
+            self.chat_input.setPlaceholderText(self._t('chat_placeholder'))
+            # v6.80：标题栏「新对话」跟着语言走
+            try:
+                self.chat_new_btn.setText(self._t('new_chat'))
+                self.chat_new_btn.setToolTip(self._t('new_chat_tip'))
+            except Exception as _exc:
+                _silent_log('_set_language:new_btn', _exc)
+            msg = '语言已切换为中文' if lang == 'zh' else 'Language switched to English'
+            self._notify(msg)
+            self.say_plain(msg, immediate=True)
+
+
+def main():
+    # 显式设置 DPI awareness（必须在 QApplication 创建之前！）
+    # pythonw 默认 DPI UNAWARE，从 bat/explorer 启动时 Win11 会给无边框窗口
+    # 画灰色边框 + 白色背景（老问题根因）。设为 PER_MONITOR_DPI_AWARE 后透明正常。
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            pl.enable_dpi_awareness()  # 回退：SYSTEM_DPI_AWARE
+        except Exception:
+            pass
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    pet = PetWidget()
+    pet.show()
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()

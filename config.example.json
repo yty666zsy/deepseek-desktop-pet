@@ -1,0 +1,12 @@
+{
+  "_note": "本机/账号级设置。模型身份（模型 ID、显示名、接口地址、温度、输出上限、价格）在 models.json 里，模板见 models.json.example。",
+  "city": "重庆",
+  "personality": "温柔",
+  "reply_style": "normal",
+  "active_chat": false,
+  "app_aliases": {},
+  "search_api_key": "",
+  "ld_city": "",
+  "ld_my_city": "",
+  "ld_alert": true
+}
