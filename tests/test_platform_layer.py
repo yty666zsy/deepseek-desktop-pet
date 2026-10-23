@@ -99,6 +99,7 @@ def test_foreground_delegates(monkeypatch):
 def test_ocr_delegates(monkeypatch):
     import pet_docs
     seen = []
+    monkeypatch.setattr(pl, 'is_windows', lambda: True)
     monkeypatch.setattr(pet_docs, 'ocr_image', lambda path, ps1: seen.append((path, ps1)) or '识别结果')
     assert pl.ocr_image('a.png', 'ocr_helper.ps1') == '识别结果'
     assert seen == [('a.png', 'ocr_helper.ps1')]
@@ -127,6 +128,7 @@ def test_speak_delegates_to_voice_io():
 
 def test_hotkey_filter_delegates(monkeypatch):
     import pet_sysutils
+    monkeypatch.setattr(pl, 'is_windows', lambda: True)
     monkeypatch.setattr(pet_sysutils, 'hotkey_filter_factory', lambda cb: ('filter', cb))
     got = pl.hotkey_filter({1: 'cb'})
     assert got == ('filter', {1: 'cb'})
@@ -152,6 +154,7 @@ def test_register_hotkey_uses_user32(monkeypatch):
     class _FakeCtypes:
         windll = _Windll()
 
+    monkeypatch.setattr(pl, 'is_windows', lambda: True)
     monkeypatch.setattr(pl, 'ctypes', _FakeCtypes)
     assert pl.register_hotkey(1, pl.MOD_CONTROL | pl.MOD_ALT, 0x50) is True
     assert pl.unregister_hotkey(1) is True
@@ -162,27 +165,34 @@ def test_beep_returns_bool():
     assert pl.beep('ok') in (True, False)
 
 
-# ---------------------------------------------------------------- 降级：非 Windows
+# ---------------------------------------------------------------- 降级：未支持平台
 
 @pytest.fixture
-def _as_linux(monkeypatch):
-    monkeypatch.setattr(pl, 'platform_name', lambda: 'linux')
+def _as_unsupported(monkeypatch):
+    monkeypatch.setattr(pl, 'platform_name', lambda: 'other')
     monkeypatch.setattr(pl, 'is_windows', lambda: False)
 
 
-def test_non_windows_degrades_without_exception(_as_linux):
+def test_non_windows_degrades_without_exception(_as_unsupported, monkeypatch):
+    import pet_sysutils
+    monkeypatch.setattr(pet_sysutils, 'open_shell_target', lambda t: False)
     assert pl.open_path('x') is False
-    assert pl.open_url('http://a') is False
-    assert pl.open_search('q') is False
-    assert pl.clipboard_get() == ''
-    assert pl.clipboard_set('x') is False
     assert pl.ocr_image('a.png') == ''
-    assert pl.beep('ok') is False
     assert pl.hotkey_filter({}) is None
     assert pl.register_hotkey(1, 0, 0) is False
     assert pl.unregister_hotkey(1) is False
     caps = pl.capabilities()
-    for key in ('open_path', 'open_url', 'clipboard', 'hotkey', 'beep', 'autostart', 'window_effects'):
+    for key in ('hotkey', 'ocr', 'tts', 'asr', 'dpi_awareness'):
+        assert caps[key]['ok'] is False and caps[key]['via'] == 'unavailable'
+
+
+def test_linux_capabilities(monkeypatch):
+    monkeypatch.setattr(pl, 'platform_name', lambda: 'linux')
+    monkeypatch.setattr(pl, 'is_windows', lambda: False)
+    caps = pl.capabilities()
+    for key in ('open_path', 'open_url', 'clipboard', 'window_effects', 'autostart', 'beep', 'lock_screen'):
+        assert caps[key]['ok'] is True and caps[key]['via'] == 'module'
+    for key in ('ocr', 'tts', 'asr', 'hotkey', 'dpi_awareness'):
         assert caps[key]['ok'] is False and caps[key]['via'] == 'unavailable'
 
 
@@ -232,6 +242,7 @@ def test_autostart_enable_disable(tmp_path, monkeypatch):
         open(path, 'w', encoding='utf-8').write('lnk')
         return True
 
+    monkeypatch.setattr(pl, 'is_windows', lambda: True)
     monkeypatch.setattr(pl, 'create_autostart_lnk', fake_create)
     monkeypatch.setattr(pl, '_cleanup_legacy', lambda sd=None: [])
 
@@ -248,6 +259,7 @@ def test_autostart_enable_disable(tmp_path, monkeypatch):
 
 def test_autostart_toggle_reports_new_state(tmp_path, monkeypatch):
     d = str(tmp_path)
+    monkeypatch.setattr(pl, 'is_windows', lambda: True)
     monkeypatch.setattr(pl, 'create_autostart_lnk',
                         lambda p, t, w: (open(p, 'w').write('x'), True)[1])
     monkeypatch.setattr(pl, '_cleanup_legacy', lambda sd=None: [])
@@ -267,6 +279,7 @@ def test_autostart_cleans_legacy_items(tmp_path, monkeypatch):
     d = str(tmp_path)
     for old in pl.AUTOSTART_LEGACY:
         open(os.path.join(d, old), 'w', encoding='utf-8').write('old')
+    monkeypatch.setattr(pl, 'is_windows', lambda: True)
     monkeypatch.setattr(pl, 'create_autostart_lnk',
                         lambda p, t, w: (open(p, 'w').write('x'), True)[1])
     calls = []
@@ -286,6 +299,7 @@ def test_autostart_target_dev_vs_frozen(tmp_path, monkeypatch):
     """开发版 → 启动桌宠.bat（存在时）；打包版 → exe 本身"""
     bat = tmp_path / '启动桌宠.bat'
     bat.write_text('@echo off', encoding='utf-8')
+    monkeypatch.setattr(pl, 'is_windows', lambda: True)
     monkeypatch.delattr(__import__('sys'), 'frozen', raising=False)
     t, w = pl.autostart_target(base_dir=str(tmp_path), script_path=str(tmp_path / 'desktop_pet.py'))
     assert t == str(bat) and w == str(tmp_path)
@@ -297,9 +311,10 @@ def test_autostart_target_dev_vs_frozen(tmp_path, monkeypatch):
 
 def test_autostart_non_windows_degrades(tmp_path, monkeypatch):
     monkeypatch.setattr(pl, 'is_windows', lambda: False)
+    monkeypatch.setattr(pl, 'platform_name', lambda: 'other')
     monkeypatch.setattr(pl, '_cleanup_legacy', lambda sd=None: [])
     ok, msg = pl.autostart_set(True, str(tmp_path))
-    assert ok is False and 'Windows' in msg
+    assert ok is False and ('Windows' in msg or '暂不支持' in msg)
 
 
 # ---------------------------------------------------------------- 窗口特效（批次 2）
@@ -358,6 +373,7 @@ def test_foreground_helpers_delegate(monkeypatch):
 
 def test_lock_screen_and_dpi_degrade_off_windows(monkeypatch):
     monkeypatch.setattr(pl, 'is_windows', lambda: False)
+    monkeypatch.setattr(pl, 'platform_name', lambda: 'other')
     assert pl.lock_screen() is False
     assert pl.enable_dpi_awareness() is False
 

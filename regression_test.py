@@ -697,7 +697,8 @@ def t_h17():
     assert reg.get('pro').model_id == 'deepseek-v4-pro'
     assert reg.get('flash').price_known
     # 实际 config.json 里不应再出现死键
-    live = json.load(io.open(os.path.join(BASE, 'config.json'), encoding='utf-8'))
+    cfg_file = os.path.join(BASE, 'config.json') if os.path.exists(os.path.join(BASE, 'config.json')) else os.path.join(BASE, 'config.example.json')
+    live = json.load(io.open(cfg_file, encoding='utf-8'))
     for dead in ('deepseek_model', 'model_flash', 'model_pro'):
         assert dead not in live, 'config.json 里还残留死键 %s' % dead
 

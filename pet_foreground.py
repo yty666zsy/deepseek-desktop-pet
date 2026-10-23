@@ -17,6 +17,7 @@
 """
 import ctypes
 import os
+import sys
 
 __all__ = ['foreground_process_name', 'categorize', 'busy_level', 'is_busy',
            'busy_hint', 'privacy_note', 'category_label', 'LEVEL_HIGH', 'LEVEL_MID']
@@ -80,36 +81,62 @@ def _basename(path):
 
 
 def foreground_process_name():
-    """前台窗口所属进程的可执行文件名（如 'code.exe'）；取不到返回 ''。
+    """前台窗口所属进程的可执行文件名（如 'code.exe' 或 'code'）；取不到返回 ''。
 
-    只调用 GetForegroundWindow / GetWindowThreadProcessId / QueryFullProcessImageNameW，
-    **不调用任何取窗口标题的 API**（见模块头部隐私边界第 2 条）。
+    只调用系统接口取进程名，不调用任何取窗口标题或内容的 API（见模块头部隐私边界第 2 条）。
     """
-    if os.name != 'nt':
-        return ''
-    try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return ''
-        pid = ctypes.c_ulong(0)
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if not pid.value:
-            return ''
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-        if not handle:
-            return ''
+    if os.name == 'nt':
         try:
-            buf = ctypes.create_unicode_buffer(1024)
-            size = ctypes.c_ulong(len(buf))
-            ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
-            return _basename(buf.value) if ok else ''
-        finally:
-            kernel32.CloseHandle(handle)
-    except Exception:
-        return ''
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return ''
+            pid = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value:
+                return ''
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+            if not handle:
+                return ''
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = ctypes.c_ulong(len(buf))
+                ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+                return _basename(buf.value) if ok else ''
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return ''
+    elif sys.platform.startswith('linux'):
+        try:
+            import shutil, subprocess
+            if shutil.which('xdotool'):
+                r = subprocess.run(['xdotool', 'getactivewindow', 'getwindowpid'],
+                                   capture_output=True, text=True, timeout=1)
+                if r.returncode == 0 and r.stdout.strip().isdigit():
+                    pid = r.stdout.strip()
+                    comm_path = f'/proc/{pid}/comm'
+                    if os.path.exists(comm_path):
+                        with open(comm_path, 'r', encoding='utf-8') as f:
+                            return _basename(f.read().strip())
+            if shutil.which('xprop'):
+                r = subprocess.run(['xprop', '-root', '_NET_ACTIVE_WINDOW'],
+                                   capture_output=True, text=True, timeout=1)
+                if r.returncode == 0 and 'window id #' in r.stdout:
+                    wid = r.stdout.split('window id #')[1].strip().split()[0]
+                    r2 = subprocess.run(['xprop', '-id', wid, '_NET_WM_PID'],
+                                        capture_output=True, text=True, timeout=1)
+                    if r2.returncode == 0 and '=' in r2.stdout:
+                        pid = r2.stdout.split('=')[1].strip()
+                        comm_path = f'/proc/{pid}/comm'
+                        if os.path.exists(comm_path):
+                            with open(comm_path, 'r', encoding='utf-8') as f:
+                                return _basename(f.read().strip())
+        except Exception:
+            return ''
+    return ''
 
 
 def categorize(process):

@@ -233,13 +233,22 @@ def quote_ps_single(value):
 
 
 def open_shell_target(target):
-    """用 ShellExecute 打开应用/文件/文件夹（os.startfile 不过 cmd，& | > 无注入面）"""
+    """用默认方式打开应用/文件/文件夹（Windows: os.startfile; Linux: xdg-open; macOS: open）"""
     try:
         t = str(target or '').strip()
         if not t:
             return False
-        _os.startfile(t)
-        return True
+        if hasattr(_os, 'startfile'):
+            _os.startfile(t)
+            return True
+        import shutil
+        if shutil.which('xdg-open'):
+            _subprocess.Popen(['xdg-open', t], stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
+            return True
+        elif shutil.which('open'):
+            _subprocess.Popen(['open', t], stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
+            return True
+        return False
     except Exception:
         return False
 
@@ -268,67 +277,125 @@ def is_safe_process_name(name):
 
 
 def read_clipboard_text():
-    """读取剪贴板文本（纯 ctypes，worker 线程安全）"""
+    """读取剪贴板文本（Windows: ctypes; Linux/其他: Qt clipboard 或 xclip/wl-paste）"""
     try:
         import ctypes
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        # 64 位下句柄/指针必须显式声明 restype + argtypes，否则默认 32 位 c_int 截断
-        user32.GetClipboardData.restype = ctypes.c_void_p
-        kernel32.GlobalLock.restype = ctypes.c_void_p
-        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-        if not user32.OpenClipboard(0):
-            return None
-        try:
-            if not user32.IsClipboardFormatAvailable(13):  # CF_UNICODETEXT
+        if hasattr(ctypes, 'windll'):
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            user32.GetClipboardData.restype = ctypes.c_void_p
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            if not user32.OpenClipboard(0):
                 return None
-            h = user32.GetClipboardData(13)
-            if not h:
-                return None
-            p = kernel32.GlobalLock(h)
             try:
-                return ctypes.c_wchar_p(p).value or ''
+                if not user32.IsClipboardFormatAvailable(13):  # CF_UNICODETEXT
+                    return None
+                h = user32.GetClipboardData(13)
+                if not h:
+                    return None
+                p = kernel32.GlobalLock(h)
+                try:
+                    return ctypes.c_wchar_p(p).value or ''
+                finally:
+                    kernel32.GlobalUnlock(h)
             finally:
-                kernel32.GlobalUnlock(h)
-        finally:
-            user32.CloseClipboard()
+                user32.CloseClipboard()
     except Exception:
-        return None
+        pass
+
+    # 非 Windows / 降级逻辑：优先使用 Qt QApplication 剪贴板
+    try:
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            cb = app.clipboard()
+            return cb.text() or ''
+    except Exception:
+        pass
+
+    # 无 Qt GUI 实例时的命令行降级
+    try:
+        import shutil
+        if shutil.which('wl-paste'):
+            r = _subprocess.run(['wl-paste', '--no-newline'], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                return r.stdout
+        elif shutil.which('xclip'):
+            r = _subprocess.run(['xclip', '-selection', 'clipboard', '-o'], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                return r.stdout
+        elif shutil.which('xsel'):
+            r = _subprocess.run(['xsel', '--clipboard', '--output'], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                return r.stdout
+    except Exception:
+        pass
+    return None
 
 
 def write_clipboard_text(text):
-    """写入剪贴板文本（纯 ctypes，worker 线程安全）"""
+    """写入剪贴板文本（Windows: ctypes; Linux/其他: Qt clipboard 或 xclip/wl-copy）"""
     try:
         import ctypes
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        kernel32.GlobalAlloc.restype = ctypes.c_void_p
-        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
-        kernel32.GlobalLock.restype = ctypes.c_void_p
-        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-        user32.SetClipboardData.restype = ctypes.c_void_p
-        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
-        if not user32.OpenClipboard(0):
-            return False
-        try:
-            user32.EmptyClipboard()
-            data = str(text).encode('utf-16-le') + b'\x00\x00'
-            h = kernel32.GlobalAlloc(0x0042, len(data))  # GMEM_MOVEABLE | GMEM_ZEROINIT
-            if not h:
+        if hasattr(ctypes, 'windll'):
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GlobalAlloc.restype = ctypes.c_void_p
+            kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            user32.SetClipboardData.restype = ctypes.c_void_p
+            user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+            if not user32.OpenClipboard(0):
                 return False
-            p = kernel32.GlobalLock(h)
-            if not p:
-                return False
-            ctypes.memmove(p, data, len(data))
-            kernel32.GlobalUnlock(h)
-            user32.SetClipboardData(13, h)
-            return True
-        finally:
-            user32.CloseClipboard()
+            try:
+                user32.EmptyClipboard()
+                data = str(text).encode('utf-16-le') + b'\x00\x00'
+                h = kernel32.GlobalAlloc(0x0042, len(data))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+                if not h:
+                    return False
+                p = kernel32.GlobalLock(h)
+                if not p:
+                    return False
+                ctypes.memmove(p, data, len(data))
+                kernel32.GlobalUnlock(h)
+                user32.SetClipboardData(13, h)
+                return True
+            finally:
+                user32.CloseClipboard()
     except Exception:
-        return False
+        pass
+
+    # 非 Windows / 降级逻辑：优先使用 Qt QApplication 剪贴板
+    try:
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            cb = app.clipboard()
+            cb.setText(str(text))
+            return True
+    except Exception:
+        pass
+
+    # 无 Qt GUI 实例时的命令行降级
+    try:
+        import shutil
+        t = str(text)
+        if shutil.which('wl-copy'):
+            r = _subprocess.run(['wl-copy'], input=t, text=True, timeout=2)
+            return r.returncode == 0
+        elif shutil.which('xclip'):
+            r = _subprocess.run(['xclip', '-selection', 'clipboard'], input=t, text=True, timeout=2)
+            return r.returncode == 0
+        elif shutil.which('xsel'):
+            r = _subprocess.run(['xsel', '--clipboard', '--input'], input=t, text=True, timeout=2)
+            return r.returncode == 0
+    except Exception:
+        pass
+    return False
 
 
 def run_ps(command, timeout=15, skip_check=False):
@@ -436,7 +503,9 @@ def volume_ps(script):
 
 
 def hotkey_filter_factory(callbacks):
-    """创建全局热键过滤器（WM_HOTKEY）。callbacks: {hotkey_id: callback}"""
+    """创建全局热键过滤器（WM_HOTKEY，Windows 专有）。callbacks: {hotkey_id: callback}"""
+    if _os.name != 'nt':
+        return None
     import ctypes.wintypes  # 必须显式导入（Python 3.14 中 ctypes.wintypes 不随 ctypes 自动加载）
     from PySide6.QtCore import QAbstractNativeEventFilter
 
