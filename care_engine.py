@@ -25,20 +25,30 @@ _log = get_logger('care_engine')
 
 
 def user_idle_minutes():
-    """用户空闲分钟数（GetLastInputInfo，纯 ctypes）"""
+    """用户空闲分钟数（Windows: GetLastInputInfo; Linux: xprintidle）"""
     try:
         import ctypes
+        if hasattr(ctypes, 'windll'):
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [('cbSize', ctypes.c_uint), ('dwTime', ctypes.c_uint)]
 
-        class LASTINPUTINFO(ctypes.Structure):
-            _fields_ = [('cbSize', ctypes.c_uint), ('dwTime', ctypes.c_uint)]
-
-        lii = LASTINPUTINFO()
-        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-        ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
-        millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
-        return millis / 60000.0
+            lii = LASTINPUTINFO()
+            lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
+            millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+            return millis / 60000.0
     except Exception:
-        return 0.0
+        pass
+
+    try:
+        import shutil, subprocess
+        if shutil.which('xprintidle'):
+            res = subprocess.run(['xprintidle'], capture_output=True, text=True, timeout=1)
+            if res.returncode == 0 and res.stdout.strip().isdigit():
+                return int(res.stdout.strip()) / 60000.0
+    except Exception:
+        pass
+    return 0.0
 
 
 def judge_wakeup(api_key, model, state, char_name, record_cb=None, endpoint=None, busy_hint=None):

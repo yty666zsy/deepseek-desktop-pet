@@ -20,7 +20,10 @@ import time
 import ctypes
 import threading  # v6.18 ApiStats 需要
 import datetime  # v6.18 ApiStats 需要（record/调试日志）
-import winsound
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 # P1 模块化：系统工具层 / 存储层（拆自本文件，纯函数无 UI 依赖）
 from pet_sysutils import (
@@ -1293,22 +1296,36 @@ class PetWidget(QWidget):
             mem = ''
             try:
                 import ctypes
-
-                class _MS(ctypes.Structure):
-                    _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
-                                ('ullTotalPhys', ctypes.c_ulonglong),
-                                ('ullAvailPhys', ctypes.c_ulonglong),
-                                ('ullTotalPageFile', ctypes.c_ulonglong),
-                                ('ullAvailPageFile', ctypes.c_ulonglong),
-                                ('ullTotalVirtual', ctypes.c_ulonglong),
-                                ('ullAvailVirtual', ctypes.c_ulonglong),
-                                ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
-                ms = _MS()
-                ms.dwLength = ctypes.sizeof(_MS)
-                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
-                used = (ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0
-                mem = '%.1f / %.1f GB（%d%%）' % (used, ms.ullTotalPhys / 1073741824.0,
-                                                int(ms.dwMemoryLoad))
+                if hasattr(ctypes, 'windll'):
+                    class _MS(ctypes.Structure):
+                        _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                                    ('ullTotalPhys', ctypes.c_ulonglong),
+                                    ('ullAvailPhys', ctypes.c_ulonglong),
+                                    ('ullTotalPageFile', ctypes.c_ulonglong),
+                                    ('ullAvailPageFile', ctypes.c_ulonglong),
+                                    ('ullTotalVirtual', ctypes.c_ulonglong),
+                                    ('ullAvailVirtual', ctypes.c_ulonglong),
+                                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+                    ms = _MS()
+                    ms.dwLength = ctypes.sizeof(_MS)
+                    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                    used = (ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0
+                    mem = '%.1f / %.1f GB（%d%%）' % (used, ms.ullTotalPhys / 1073741824.0,
+                                                    int(ms.dwMemoryLoad))
+                elif os.path.exists('/proc/meminfo'):
+                    mem_info = {}
+                    with open('/proc/meminfo', 'r', encoding='utf-8') as f:
+                        for line in f:
+                            parts = line.split(':')
+                            if len(parts) == 2:
+                                mem_info[parts[0].strip()] = int(parts[1].strip().split()[0])
+                    total_kb = mem_info.get('MemTotal', 0)
+                    avail_kb = mem_info.get('MemAvailable', 0)
+                    used_kb = max(0, total_kb - avail_kb)
+                    total_gb = total_kb / (1024 * 1024)
+                    used_gb = used_kb / (1024 * 1024)
+                    load = (used_kb / total_kb * 100) if total_kb else 0
+                    mem = '%.1f / %.1f GB（%d%%）' % (used_gb, total_gb, int(load))
             except Exception:
                 mem = '—'
             d['mem'] = mem or '—'
@@ -1541,6 +1558,37 @@ class PetWidget(QWidget):
                     continue
         except Exception as _exc:
             _silent_log('_build_app_index:998', _exc)   # v6.54
+        # 3. Linux 桌面快捷方式（.desktop）
+        if sys.platform.startswith('linux'):
+            try:
+                desktop_dirs = [
+                    '/usr/share/applications',
+                    os.path.expanduser('~/.local/share/applications'),
+                    '/var/lib/flatpak/exports/share/applications'
+                ]
+                seen_desktop = set()
+                for d in desktop_dirs:
+                    if not os.path.isdir(d):
+                        continue
+                    for f in os.listdir(d):
+                        if not f.endswith('.desktop'):
+                            continue
+                        full_p = os.path.join(d, f)
+                        try:
+                            name, exec_cmd = '', ''
+                            with open(full_p, 'r', encoding='utf-8', errors='ignore') as df:
+                                for dline in df:
+                                    if dline.startswith('Name=') and not name:
+                                        name = dline.split('=', 1)[1].strip()
+                                    elif dline.startswith('Exec=') and not exec_cmd:
+                                        exec_cmd = dline.split('=', 1)[1].strip().split()[0]
+                            if name and name not in seen_desktop:
+                                seen_desktop.add(name)
+                                apps.append({'name': name, 'path': full_p, 'exe': os.path.basename(exec_cmd).lower() if exec_cmd else ''})
+                        except Exception:
+                            continue
+            except Exception as _exc:
+                _silent_log('_build_app_index:linux', _exc)
         return apps
 
     def _load_app_index(self):
@@ -1571,17 +1619,32 @@ class PetWidget(QWidget):
         if not apps:
             return None
 
-        # 系统自带应用直映射（无快捷方式，直接给 system32 路径）
-        sysapps = {
-            'notepad': (r'C:\Windows\System32\notepad.exe', '记事本'),
-            'calc': (r'C:\Windows\System32\calc.exe', '计算器'),
-            'calculator': (r'C:\Windows\System32\calc.exe', '计算器'),
-            'paint': (r'C:\Windows\System32\mspaint.exe', '画图'),
-            'taskmgr': (r'C:\Windows\System32\Taskmgr.exe', '任务管理器'),
-            'control': (r'C:\Windows\System32\control.exe', '控制面板'),
-            'mstsc': (r'C:\Windows\System32\mstsc.exe', '远程桌面'),
-            'explorer': (r'C:\Windows\explorer.exe', '资源管理器'),
-        }
+        # 系统自带应用直映射
+        if sys.platform.startswith('linux'):
+            import shutil
+            editor = (shutil.which('gedit') or shutil.which('kwrite') or shutil.which('kate') or
+                      shutil.which('gnome-text-editor') or shutil.which('mousepad') or
+                      shutil.which('nano') or '/usr/bin/nano')
+            calc = (shutil.which('gnome-calculator') or shutil.which('kcalc') or
+                    shutil.which('xcalc') or shutil.which('bc') or '/usr/bin/bc')
+            sysapps = {
+                'notepad': (editor, '记事本'),
+                'calc': (calc, '计算器'),
+                'calculator': (calc, '计算器'),
+                'terminal': (shutil.which('konsole') or shutil.which('gnome-terminal') or
+                             shutil.which('x-terminal-emulator') or '/usr/bin/bash', '终端'),
+            }
+        else:
+            sysapps = {
+                'notepad': (r'C:\Windows\System32\notepad.exe', '记事本'),
+                'calc': (r'C:\Windows\System32\calc.exe', '计算器'),
+                'calculator': (r'C:\Windows\System32\calc.exe', '计算器'),
+                'paint': (r'C:\Windows\System32\mspaint.exe', '画图'),
+                'taskmgr': (r'C:\Windows\System32\Taskmgr.exe', '任务管理器'),
+                'control': (r'C:\Windows\System32\control.exe', '控制面板'),
+                'mstsc': (r'C:\Windows\System32\mstsc.exe', '远程桌面'),
+                'explorer': (r'C:\Windows\explorer.exe', '资源管理器'),
+            }
         for at in self.COMMON_ALIASES.values():
             pass
         if q in self.COMMON_ALIASES and self.COMMON_ALIASES[q] in sysapps:

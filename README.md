@@ -56,7 +56,9 @@
    python -m pip install -r requirements.txt
    python desktop_pet.py
    ```
-4. 以后启动，直接双击项目里的 `启动桌宠.bat`（已装好的依赖会复用）。
+4. 以后启动：
+   - **Windows**：双击项目里的 `启动桌宠.bat`。
+   - **Linux 桌面**：终端执行 `./启动桌宠.sh` 或 `python3 desktop_pet.py`（若在 Wayland 下建议使用 `QT_QPA_PLATFORM=xcb` 以保证悬浮置顶透明效果最佳）。
 
 **源码启动常见卡点：**
 

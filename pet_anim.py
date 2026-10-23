@@ -50,14 +50,24 @@ SCENE_ACTIONS = {
 
 
 def idle_seconds():
-    """系统空闲秒数（GetLastInputInfo，零依赖）"""
+    """系统空闲秒数（Windows: GetLastInputInfo; Linux: xprintidle）"""
     try:
-        class LASTINPUTINFO(ctypes.Structure):
-            _fields_ = [('cbSize', ctypes.c_uint), ('dwTime', ctypes.c_uint)]
-        lii = LASTINPUTINFO()
-        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-            return (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
+        if hasattr(ctypes, 'windll'):
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [('cbSize', ctypes.c_uint), ('dwTime', ctypes.c_uint)]
+            lii = LASTINPUTINFO()
+            lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                return (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
+    except Exception:
+        pass
+
+    try:
+        import shutil, subprocess
+        if shutil.which('xprintidle'):
+            res = subprocess.run(['xprintidle'], capture_output=True, text=True, timeout=1)
+            if res.returncode == 0 and res.stdout.strip().isdigit():
+                return int(res.stdout.strip()) / 1000.0
     except Exception:
         pass
     return 0

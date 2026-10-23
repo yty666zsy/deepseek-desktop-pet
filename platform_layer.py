@@ -75,22 +75,23 @@ def capabilities():
     只做**存在性查询**(find_spec),不 import 任何实现模块。
     """
     win = is_windows()
+    linux = platform_name() == 'linux'
     out = {}
 
     def put(key, ok, via, note=''):
         out[key] = {'ok': bool(ok), 'via': via if ok else 'unavailable', 'note': note}
 
-    sysutils_ok = win and _probe('pet_sysutils')
+    sysutils_ok = (win or linux) and _probe('pet_sysutils')
     fg_ok = _probe('pet_foreground')
-    docs_ok = _probe('pet_docs')
-    voice_ok = _probe('voice_io')
-    asr_ok = _probe('asr')
+    docs_ok = win and _probe('pet_docs')
+    voice_ok = win and _probe('voice_io')
+    asr_ok = win and _probe('asr')
     put('open_path', sysutils_ok, 'module' if sysutils_ok else 'unavailable',
-        'ShellExecute 打开文件/目录/应用')
+        'ShellExecute / xdg-open 打开文件/目录/应用')
     put('open_url', sysutils_ok, 'module' if sysutils_ok else 'unavailable',
         '用默认浏览器打开链接/搜索')
     put('clipboard', sysutils_ok, 'module' if sysutils_ok else 'unavailable',
-        '读写剪贴板(经 PowerShell)')
+        '读写剪贴板（Qt / xclip / PowerShell）')
     put('foreground', fg_ok, 'module' if fg_ok else 'unavailable',
         '只读前台进程名(不含标题/内容)')
     put('ocr', docs_ok, 'module' if docs_ok else 'unavailable',
@@ -101,14 +102,16 @@ def capabilities():
         '麦克风识别(WinRT,需系统语音隐私开关)')
     put('hotkey', win, 'module' if win else 'unavailable',
         '全局热键(RegisterHotKey + WM_HOTKEY 事件过滤器)')
-    # -- 尚未收编:有待宿主绑定时才算"可用",否则明确报 unavailable(不假装支持)
-    put('autostart', win, 'module' if win else 'unavailable',
-        '启动文件夹快捷方式（.lnk，用户可见可改）')
-    put('window_effects', win, 'module' if win else 'unavailable',
-        '无边框/置顶/工具窗/去阴影（Qt 标志 + DWM 备用）')
-    put('beep', win, 'module' if win else 'unavailable', '提示音(winsound.Beep)')
-    put('lock_screen', win, 'module' if win else 'unavailable', '锁定工作站(LockWorkStation)')
-    put('dpi_awareness', win, 'module' if win else 'unavailable', '声明进程 DPI 感知(SetProcessDPIAware)')
+    put('autostart', win or linux, 'module' if (win or linux) else 'unavailable',
+        '开机自启动（Windows .lnk / Linux .desktop）')
+    put('window_effects', True, 'module',
+        '无边框/置顶/去阴影（Qt 标志）')
+    put('beep', win or linux, 'module' if (win or linux) else 'unavailable',
+        '提示音（winsound / canberra / 终端响铃）')
+    put('lock_screen', win or linux, 'module' if (win or linux) else 'unavailable',
+        '锁定工作站（LockWorkStation / loginctl / xdg-screensaver）')
+    put('dpi_awareness', win, 'module' if win else 'unavailable',
+        '声明进程 DPI 感知（Windows 专有，Linux 由 Qt 自动处理）')
     return out
 
 
@@ -126,44 +129,36 @@ def report():
 
 def open_path(target):
     """用系统默认方式打开文件 / 目录 / 应用(不过 cmd,无注入面)"""
-    if not is_windows():
-        return False
     try:
         from pet_sysutils import open_shell_target
-        open_shell_target(str(target))
-        return True
+        res = open_shell_target(str(target))
+        return True if res is None else bool(res)
     except Exception:
         return False
 
 
 def open_url(url):
-    if not is_windows():
-        return False
     try:
         from pet_sysutils import open_url as _open
-        _open(str(url))
-        return True
+        res = _open(str(url))
+        return True if res is None else bool(res)
     except Exception:
         return False
 
 
 def open_search(query, engine=None):
-    if not is_windows():
-        return False
     try:
         from pet_sysutils import open_search_url
         if engine:
-            open_search_url(str(query), engine)
+            res = open_search_url(str(query), engine)
         else:
-            open_search_url(str(query))
-        return True
+            res = open_search_url(str(query))
+        return True if res is None else bool(res)
     except Exception:
         return False
 
 
 def clipboard_get():
-    if not is_windows():
-        return ''
     try:
         from pet_sysutils import read_clipboard_text
         return read_clipboard_text() or ''
@@ -172,12 +167,10 @@ def clipboard_get():
 
 
 def clipboard_set(text):
-    if not is_windows():
-        return False
     try:
         from pet_sysutils import write_clipboard_text
-        write_clipboard_text(str(text))
-        return True
+        res = write_clipboard_text(str(text))
+        return True if res is None else bool(res)
     except Exception:
         return False
 
@@ -243,35 +236,58 @@ def asr_available():
 def beep(kind='msg'):
     """提示音：'msg'（新消息）/ 'remind'（提醒）/ 其它 → 短促一声
 
-    频率与宿主原实现逐字一致（等值搬迁）：msg=880+1320、remind=660+990、其它=660。
-    兼容别名：ok→msg、err/notify→remind。
+    Windows: winsound.Beep
+    Linux: canberra-gtk-play 或 终端响铃
     """
-    if not is_windows():
-        return False
-    kind = {'ok': 'msg', 'err': 'remind', 'notify': 'remind'}.get(kind, kind)
-    seq = {'msg': [(880, 80), (1320, 80)], 'remind': [(660, 200), (990, 200)]}.get(kind, [(660, 100)])
-    try:
-        import winsound
-        for freq, dur in seq:
-            winsound.Beep(freq, dur)
-        return True
-    except Exception:
-        return False
+    if is_windows():
+        kind = {'ok': 'msg', 'err': 'remind', 'notify': 'remind'}.get(kind, kind)
+        seq = {'msg': [(880, 80), (1320, 80)], 'remind': [(660, 200), (990, 200)]}.get(kind, [(660, 100)])
+        try:
+            import winsound
+            for freq, dur in seq:
+                winsound.Beep(freq, dur)
+            return True
+        except Exception:
+            return False
+    elif platform_name() == 'linux':
+        try:
+            import shutil, subprocess
+            if shutil.which('canberra-gtk-play'):
+                sound_id = 'message-new-instant' if kind in ('msg', 'ok') else 'dialog-information'
+                subprocess.Popen(['canberra-gtk-play', '-i', sound_id],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            sys.stdout.write('\a')
+            sys.stdout.flush()
+            return True
+        except Exception:
+            return False
+    return False
 
 
 def lock_screen():
-    """锁定工作站（Win+L 的效果）"""
-    if not is_windows():
-        return False
-    try:
-        import ctypes
-        return bool(ctypes.windll.user32.LockWorkStation())
-    except Exception:
-        return False
+    """锁定工作站（Windows: LockWorkStation; Linux: loginctl / xdg-screensaver）"""
+    if is_windows():
+        try:
+            import ctypes
+            return bool(ctypes.windll.user32.LockWorkStation())
+        except Exception:
+            return False
+    elif platform_name() == 'linux':
+        try:
+            import shutil, subprocess
+            for cmd in (['loginctl', 'lock-session'], ['xdg-screensaver', 'lock']):
+                if shutil.which(cmd[0]):
+                    res = subprocess.run(cmd, capture_output=True, timeout=5)
+                    if res.returncode == 0:
+                        return True
+        except Exception:
+            pass
+    return False
 
 
 def enable_dpi_awareness():
-    """声明本进程 DPI 感知（高 DPI 下窗口不糊/不错位）"""
+    """声明本进程 DPI 感知（高 DPI 下窗口不糊/不错位，Windows 专有）"""
     if not is_windows():
         return False
     try:
@@ -355,6 +371,7 @@ def unregister_hotkey(hotkey_id):
 # 导致「只想关」永远成立、**打开自启的代码是死代码** —— 现在改成显式的 set(on)。
 
 AUTOSTART_LNK_NAME = 'DeepSeekPet.lnk'
+AUTOSTART_DESKTOP_NAME = 'DeepSeekPet.desktop'
 AUTOSTART_LEGACY = ('DeepSeekPet.bat', 'DeepSeekPet.cmd')
 AUTOSTART_RUN_VALUE = 'DeepSeekPet'
 
@@ -365,14 +382,36 @@ def startup_dir():
     return os.path.join(appdata, r'Microsoft\Windows\Start Menu\Programs\Startup')
 
 
+def linux_autostart_dir():
+    """Linux XDG autostart 目录"""
+    cfg = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    return os.path.join(cfg, 'autostart')
+
+
 def autostart_path(startup_directory=None):
-    return os.path.join(startup_directory or startup_dir(), AUTOSTART_LNK_NAME)
+    if is_windows():
+        return os.path.join(startup_directory or startup_dir(), AUTOSTART_LNK_NAME)
+    elif platform_name() == 'linux':
+        if startup_directory:
+            lnk = os.path.join(startup_directory, AUTOSTART_LNK_NAME)
+            dt = os.path.join(startup_directory, AUTOSTART_DESKTOP_NAME)
+            if os.path.exists(lnk) and not os.path.exists(dt):
+                return lnk
+            return dt
+        return os.path.join(linux_autostart_dir(), AUTOSTART_DESKTOP_NAME)
+    return os.path.join(startup_directory or '.', AUTOSTART_DESKTOP_NAME)
 
 
 def autostart_enabled(startup_directory=None):
-    """启动文件夹里有没有我们的快捷方式"""
+    """启动文件夹/目录里有没有我们的快捷方式"""
     try:
-        return os.path.exists(autostart_path(startup_directory))
+        p = autostart_path(startup_directory)
+        if os.path.exists(p):
+            return True
+        if startup_directory:
+            return (os.path.exists(os.path.join(startup_directory, AUTOSTART_LNK_NAME)) or
+                    os.path.exists(os.path.join(startup_directory, AUTOSTART_DESKTOP_NAME)))
+        return False
     except Exception:
         return False
 
@@ -400,18 +439,25 @@ def _main_dir():
 
 
 def autostart_target(base_dir=None, script_path=None):
-    """(target, workdir)：打包版 → exe 本身；开发版 → 启动桌宠.bat（无则 pythonw + 脚本）
+    """(target, workdir)：打包版 → exe 本身；开发版 → 启动脚本（无则 pythonw/python + 脚本）
 
     与原宿主实现逐行对应（只把“当前文件”改成可传入，便于测试）。
     """
     if getattr(sys, 'frozen', False):
         return sys.executable, os.path.dirname(sys.executable)
     base = base_dir or _main_dir()
-    bat = os.path.join(base, '启动桌宠.bat')
-    if os.path.exists(bat):
-        return bat, base
-    script = script_path or os.path.join(base, os.path.basename(sys.argv[0] or 'desktop_pet.py'))
-    return '"%s" "%s"' % (autostart_pythonw(), script), base
+    if is_windows():
+        bat = os.path.join(base, '启动桌宠.bat')
+        if os.path.exists(bat):
+            return bat, base
+        script = script_path or os.path.join(base, os.path.basename(sys.argv[0] or 'desktop_pet.py'))
+        return '"%s" "%s"' % (autostart_pythonw(), script), base
+    else:
+        sh = os.path.join(base, '启动桌宠.sh')
+        if os.path.exists(sh):
+            return sh, base
+        script = script_path or os.path.join(base, os.path.basename(sys.argv[0] or 'desktop_pet.py'))
+        return f'{sys.executable} "{script}"', base
 
 
 def _run_ps(script, timeout=20):
@@ -428,7 +474,7 @@ def _quote(value):
 
 
 def create_autostart_lnk(path, target, workdir):
-    """用 WScript.Shell 建快捷方式"""
+    """用 WScript.Shell 建快捷方式（Windows）"""
     if not is_windows():
         return False
     ps = ('$ws = New-Object -ComObject WScript.Shell; '
@@ -442,10 +488,33 @@ def create_autostart_lnk(path, target, workdir):
     return os.path.exists(path)
 
 
+def create_autostart_desktop(path, target, workdir):
+    """用 FreeDesktop 规范建 .desktop 启动项（Linux）"""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Version=1.0\n"
+            "Name=DeepSeek Pet\n"
+            "Comment=DeepSeek Desktop Pet\n"
+            f"Exec={target}\n"
+            f"Path={workdir}\n"
+            "Terminal=false\n"
+            "StartupNotify=false\n"
+            "Categories=Utility;\n"
+        )
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return os.path.exists(path)
+    except Exception:
+        return False
+
+
 def _cleanup_legacy(startup_directory=None):
     """清理旧版启动项（.bat/.cmd 残留 + 旧注册表 Run 项），防止开机双启动"""
     removed = []
-    d = startup_directory or startup_dir()
+    d = startup_directory or (startup_dir() if is_windows() else linux_autostart_dir())
     for old in AUTOSTART_LEGACY:
         p = os.path.join(d, old)
         if os.path.exists(p):
@@ -474,19 +543,24 @@ def _cleanup_legacy(startup_directory=None):
 
 def autostart_enable(startup_directory=None, target=None, workdir=None):
     """开启开机自启 → (ok, msg)"""
-    if not is_windows():
-        return False, '非 Windows 平台暂不支持'
+    if not (is_windows() or platform_name() == 'linux'):
+        return False, '当前平台暂不支持自启'
     path = autostart_path(startup_directory)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     except Exception:
-        return False, '启动文件夹不可写'
+        return False, '自启目录不可写'
     if target is None:
         target, workdir = autostart_target()
     _cleanup_legacy(startup_directory)          # 先清旧版，防双启动
-    if not create_autostart_lnk(path, target, workdir or os.path.dirname(path)):
-        return False, '自启写入失败（快捷方式没建起来）'
-    return True, '开机自启已开启（启动文件夹快捷方式）'
+    if is_windows():
+        if not create_autostart_lnk(path, target, workdir or os.path.dirname(path)):
+            return False, '自启写入失败（快捷方式没建起来）'
+        return True, '开机自启已开启（启动文件夹快捷方式）'
+    else:
+        if not create_autostart_desktop(path, target, workdir or os.path.dirname(path)):
+            return False, '自启写入失败（.desktop 没建起来）'
+        return True, '开机自启已开启（XDG Autostart 桌面项）'
 
 
 def autostart_disable(startup_directory=None):
@@ -498,6 +572,15 @@ def autostart_disable(startup_directory=None):
             os.remove(path)
     except Exception as e:
         return False, '删除自启文件失败：%s' % e
+    if startup_directory:
+        for alt in (AUTOSTART_LNK_NAME, AUTOSTART_DESKTOP_NAME):
+            alt_p = os.path.join(startup_directory, alt)
+            if os.path.exists(alt_p):
+                try:
+                    os.remove(alt_p)
+                    existed = True
+                except Exception:
+                    pass
     _cleanup_legacy(startup_directory)
     return True, ('开机自启已关闭（下次开机需手动启动桌宠）' if existed else '开机自启本来就是关的')
 
